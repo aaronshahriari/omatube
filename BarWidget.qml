@@ -17,11 +17,11 @@ BarWidget {
   // Written as an escape rather than the literal glyph: a raw private-use
   // character does not survive every editor and tool that touches this
   // file, and when it is silently dropped the widget renders a bare number.
-  readonly property string icon: "󰒛"
+  readonly property string icon: "\uDB81\uDC9B"  // nf-md-playlist-play
 
   // A plug says "needs setup". A dimmed playlist glyph with no count would
   // read as "you have no playlists", which is the opposite.
-  readonly property string setupIcon: ""
+  readonly property string setupIcon: "\uF1E6"  // nf-fa-plug
 
   readonly property var service: bar && bar.shell && typeof bar.shell.serviceFor === "function"
     ? bar.shell.serviceFor("aaronshahriari.omatube")
@@ -30,6 +30,9 @@ BarWidget {
   readonly property var cache: service ? service.cache : Model.parseCache("")
   readonly property bool signedIn: service ? service.signedIn === true : false
   readonly property bool syncing: service ? service.syncing === true : false
+  // A play is probed for a few seconds after the panel has closed, so the
+  // bar is usually the only thing still on screen when one fails.
+  readonly property string playError: service ? service.playError : ""
   readonly property int playlistCount: (cache.playlists || []).length
 
   readonly property string barLabelMode: setting("barLabel", "Icon")
@@ -157,11 +160,13 @@ BarWidget {
     hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""
     fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
 
-    active: root.opened
+    active: root.opened || root.playError !== ""
     // A disconnected plugin should look inert rather than like zero videos.
     dimmed: !root.signedIn
 
-    tooltipText: root.signedIn
+    tooltipText: root.playError !== ""
+      ? "OmaTube — " + root.playError
+      : root.signedIn
       ? "OmaTube — " + Model.plural(root.playlistCount, "playlist")
         + "\nright click for " + Model.barLabelDescription(Model.cycleBarLabel(root.barLabelMode))
         + "\nmiddle click to refresh"

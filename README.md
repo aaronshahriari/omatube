@@ -88,13 +88,27 @@ In **Setup > Plugins > OmaTube**, or inline on the widget's entry in
 | `confirmRemove` | `true` | Off makes removal one click, still undoable |
 | `syncInterval` | `30 minutes` | Idle refresh. Opening a surface always syncs |
 
-`mpv` streams through yt-dlp, so there is no browser and no ads:
-
-```
-mpv --ytdl-format=bestvideo[height<=?1080]+bestaudio/best <url>
-```
+`mpv` streams through yt-dlp, so there is no browser and no ads. OmaTube
+deliberately passes **no** `--ytdl-format`: stream quality is a standing
+preference and belongs in your own `~/.config/mpv/mpv.conf`, not in an
+override from a playlist widget.
 
 Custom examples: `freetube {url}`, `mpv --fs {url}`, `vlc` (URL appended).
+
+### When a video will not play
+
+OmaTube starts the player detached, but watches it for a few seconds first.
+A player that dies immediately gets its error read back and shown in the
+panel and the bar tooltip, rather than failing silently. The full output of
+the last launch is kept at `~/.local/state/omarchy/omatube/player.log`.
+
+If mpv fails on every YouTube URL, test it outside OmaTube first —
+`mpv "https://www.youtube.com/watch?v=..."`. A failure there is an mpv or
+yt-dlp problem, not a plugin one. A common one on Arch: `mpv.conf` sets
+`ytdl-raw-options=cookies-from-browser=...`, which needs the keyring module —
+`sudo pacman -S python-secretstorage`. Install it from the repos, not with
+`python3 -m pip`, which yt-dlp's error text suggests but which Arch's
+externally-managed Python refuses.
 
 ## Quota
 

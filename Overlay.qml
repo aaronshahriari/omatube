@@ -37,6 +37,7 @@ Item {
   readonly property bool signedIn: svc ? svc.signedIn === true : false
   readonly property bool syncing: svc ? svc.syncing === true : false
   readonly property string actionError: svc ? svc.actionError : ""
+  readonly property string playError: svc ? svc.playError : ""
   readonly property string loadingPlaylist: svc ? svc.loadingPlaylist : ""
   readonly property var pendingRemovals: svc ? svc.pendingRemovals : []
   readonly property string undoText: svc ? svc.undoText : ""
@@ -116,12 +117,18 @@ Item {
     if (svc && selectedId !== "") svc.loadItems(selectedId, false)
   }
 
+  // Starting playback closes the view. A fullscreen list is exactly what the
+  // player is about to be behind.
   function playVideo(video) {
-    if (svc && video && video.available !== false) svc.play(video)
+    if (!svc || !video || video.available === false) return
+    svc.play(video)
+    dismiss()
   }
 
   function openVideo(video) {
-    if (svc && video) svc.openInBrowser(video)
+    if (!svc || !video) return
+    svc.openInBrowser(video)
+    dismiss()
   }
 
   function requestRemove(video) {
@@ -262,10 +269,11 @@ Item {
           anchors.right: headerActions.left
           anchors.rightMargin: Style.space(10)
           anchors.verticalCenter: parent.verticalCenter
-          text: root.actionError !== "" ? root.actionError
-            : (root.cache.channel ? root.cache.channel : "")
+          readonly property string problem: root.playError !== ""
+            ? root.playError : root.actionError
+          text: problem !== "" ? problem : (root.cache.channel ? root.cache.channel : "")
           textFormat: Text.PlainText
-          color: root.actionError !== "" ? Color.urgent : root.mutedFg
+          color: problem !== "" ? Color.urgent : root.mutedFg
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
@@ -278,17 +286,18 @@ Item {
           spacing: Style.space(4)
 
           PanelActionButton {
-            iconText: ""
+            iconText: "\uDB81\uDC0A"  // nf-md-play
             tooltipText: "Play the whole playlist"
             foreground: root.fg
             visible: root.allVideos.length > 0
             onClicked: {
               if (root.svc) root.svc.playPlaylist(root.selectedPlaylist)
+              root.dismiss()
             }
           }
 
           PanelActionButton {
-            iconText: "󰑐"
+            iconText: "\uDB81\uDC50"  // nf-md-refresh
             tooltipText: root.syncing ? "Syncing…" : "Refresh (r)"
             foreground: root.fg
             enabled: !root.syncing
@@ -297,7 +306,7 @@ Item {
           }
 
           PanelActionButton {
-            iconText: ""
+            iconText: "\uDB80\uDD56"  // nf-md-close
             tooltipText: "Close (Esc)"
             foreground: root.fg
             onClicked: root.dismiss()

@@ -45,6 +45,9 @@ Panel {
   readonly property bool syncing: svc ? svc.syncing === true : false
   readonly property bool connecting: svc ? svc.connecting === true : false
   readonly property string actionError: svc ? svc.actionError : ""
+  // A play is probed for a few seconds after the panel has already closed,
+  // so its failure lands here and is waiting the next time you open up.
+  readonly property string playError: svc ? svc.playError : ""
   readonly property string cacheError: cache.error || ""
   readonly property string loadingPlaylist: svc ? svc.loadingPlaylist : ""
   readonly property var pendingRemovals: svc ? svc.pendingRemovals : []
@@ -83,6 +86,7 @@ Panel {
 
   function openPlaylist(playlist) {
     if (!playlist) return
+    animateNav(1)
     selectedId = playlist.id
     cursor = -1
     query = ""
@@ -91,6 +95,7 @@ Panel {
   }
 
   function goBack() {
+    if (inPlaylist) animateNav(-1)
     selectedId = ""
     cursor = -1
     query = ""
@@ -103,13 +108,18 @@ Panel {
     if (inPlaylist) svc.loadItems(selectedId, true)
   }
 
+  // Starting playback dismisses the panel. You asked for a video; the list
+  // you picked it from is in the way of the thing about to open.
   function playVideo(video) {
     if (!svc || !video || video.available === false) return
     svc.play(video)
+    close()
   }
 
   function openVideo(video) {
-    if (svc && video) svc.openInBrowser(video)
+    if (!svc || !video) return
+    svc.openInBrowser(video)
+    close()
   }
 
   // Removal is destructive and the confirm setting decides how it is
@@ -133,6 +143,23 @@ Panel {
     close()
     if (bar && bar.shell && typeof bar.shell.summon === "function")
       bar.shell.summon("aaronshahriari.omatube", JSON.stringify({ playlist: selectedId }))
+  }
+
+  // A short travel, not a full-width fly-in: enough to read as direction
+  // without making every step feel like it has to be waited out.
+  function animateNav(direction) {
+    if (!rowArea) return
+    rowArea.slide = direction * Style.space(36)
+    slideAnim.restart()
+  }
+
+  NumberAnimation {
+    id: slideAnim
+    target: rowArea
+    property: "slide"
+    to: 0
+    duration: 150
+    easing.type: Easing.OutCubic
   }
 
   // ---- keyboard ----------------------------------------------------------
@@ -238,25 +265,42 @@ Panel {
             width: parent.width
             height: Math.max(headerText.implicitHeight, headerActions.implicitHeight)
 
-            PanelActionButton {
-              id: backButton
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              visible: root.inPlaylist
-              iconText: ""
-              tooltipText: "Back to playlists"
-              foreground: root.fg
-              onClicked: root.goBack()
-            }
-
             Column {
               id: headerText
-              anchors.left: root.inPlaylist ? backButton.right : parent.left
-              anchors.leftMargin: root.inPlaylist ? Style.space(4) : 0
+              anchors.left: parent.left
               anchors.right: headerActions.left
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(1)
+
+              // Naming the destination beats a bare chevron: "‹ Playlists"
+              // says both that there is a way back and where it goes, which
+              // an arrow on its own leaves you to infer.
+              Item {
+                width: parent.width
+                height: root.inPlaylist ? crumbText.implicitHeight : 0
+                visible: root.inPlaylist
+                clip: true
+
+                Text {
+                  id: crumbText
+                  text: "‹ Playlists"
+                  textFormat: Text.PlainText
+                  color: crumbMouse.containsMouse ? root.fg : Qt.darker(root.fg, 1.7)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  id: crumbMouse
+                  anchors.verticalCenter: crumbText.verticalCenter
+                  height: parent.height + Style.space(6)
+                  width: crumbText.implicitWidth + Style.space(10)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.goBack()
+                }
+              }
 
               Text {
                 width: parent.width
@@ -297,7 +341,7 @@ Panel {
               spacing: Style.space(2)
 
               PanelActionButton {
-                iconText: ""
+                iconText: "\uDB81\uDC0A"  // nf-md-play
                 tooltipText: "Play the whole playlist"
                 foreground: root.fg
                 visible: root.inPlaylist && root.allVideos.length > 0
@@ -308,7 +352,7 @@ Panel {
               }
 
               PanelActionButton {
-                iconText: "󰊓"
+                iconText: "\uDB80\uDE93"  // nf-md-fullscreen
                 tooltipText: "Open fullscreen (f)"
                 foreground: root.fg
                 visible: root.signedIn
@@ -316,7 +360,7 @@ Panel {
               }
 
               PanelActionButton {
-                iconText: "󰑐"
+                iconText: "\uDB81\uDC50"  // nf-md-refresh
                 tooltipText: root.syncing ? "Syncing…" : "Refresh (r)"
                 foreground: root.fg
                 enabled: !root.syncing
@@ -336,7 +380,8 @@ Panel {
             // While the connect form is up it already explains the state, so
             // a red "not signed in" above it is the same sentence twice.
             text: !root.signedIn ? ""
-              : (root.actionError !== "" ? root.actionError : root.cacheError)
+              : (root.playError !== "" ? root.playError
+                : (root.actionError !== "" ? root.actionError : root.cacheError))
             textFormat: Text.PlainText
             color: Color.urgent
             font.family: Style.font.family
@@ -404,6 +449,21 @@ Panel {
             }
           }
 
+          // ---- rows
+          //
+          // The list slides in from whichever side the navigation came
+          // from — right when you open a playlist, left when you come back.
+          // Without it the popup swaps one list of rows for another with no
+          // sign that anything moved, which reads as a glitch rather than a
+          // step.
+          Column {
+            id: rowArea
+            width: parent.width
+            spacing: 0
+
+            property real slide: 0
+            transform: Translate { x: rowArea.slide }
+
           // ---- playlists
           Repeater {
             model: root.signedIn && !root.inPlaylist ? root.playlists : []
@@ -436,6 +496,8 @@ Panel {
               onOpenRequested: root.openVideo(modelData)
               onRemoveRequested: root.requestRemove(modelData)
             }
+          }
+
           }
 
           // ---- confirm strip

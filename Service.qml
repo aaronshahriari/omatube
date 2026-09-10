@@ -207,22 +207,60 @@ Item {
 
   // ---- playing -----------------------------------------------------------
   //
-  // Playing is fire-and-forget: the CLI detaches the player and exits, so
-  // it never joins the write queue behind a slow removal.
+  // Plays get their own Process rather than joining the write queue. The CLI
+  // stays alive for a few seconds after starting a player to catch one that
+  // dies immediately, and a removal must not sit behind that window.
+
+  property string playError: ""
+  property var playQueue: []
+
+  readonly property bool playing: playProc.running
+
+  Process {
+    id: playProc
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw !== "") root.playError = Model.elide(raw, 160)
+      }
+    }
+    onExited: function(code) {
+      if (code === 0) root.playError = ""
+      if (root.playQueue.length > 0) {
+        var queued = root.playQueue.slice()
+        var next = queued.shift()
+        root.playQueue = queued
+        playProc.command = [root.cli].concat(next)
+        playProc.running = true
+      }
+    }
+  }
+
+  function runPlay(args) {
+    if (!args) return
+    // Clearing up front means the panel does not show the previous
+    // failure's message while a fresh attempt is still being probed.
+    playError = ""
+    if (playProc.running) {
+      playQueue = playQueue.concat([args])
+      return
+    }
+    playProc.command = [root.cli].concat(args)
+    playProc.running = true
+  }
 
   function play(video) {
-    var args = Model.playArgs(video, player, playerCommand)
-    if (args) runAction(args)
+    runPlay(Model.playArgs(video, player, playerCommand))
   }
 
   function playPlaylist(playlist) {
-    var args = Model.playPlaylistArgs(playlist, player, playerCommand)
-    if (args) runAction(args)
+    runPlay(Model.playPlaylistArgs(playlist, player, playerCommand))
   }
 
   function openInBrowser(video) {
-    var args = Model.openArgs(video)
-    if (args) runAction(args)
+    runPlay(Model.openArgs(video))
   }
 
   // ---- removal, with undo ------------------------------------------------

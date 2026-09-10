@@ -20,6 +20,7 @@ Rectangle {
   clip: true
 
   Image {
+    id: thumbImage
     anchors.fill: parent
     source: root.source
     // Off the QML thread: a panel with forty rows would otherwise block on
@@ -33,11 +34,13 @@ Rectangle {
     visible: status === Image.Ready
   }
 
-  // Stands in while loading, and permanently for rows that have no image.
+  // Stands in while loading, permanently for rows that have no image, and
+  // for one that has a URL the server will not serve — a thumbnail can 404
+  // at any time, and a silently empty box looks like a broken widget.
   Text {
     anchors.centerIn: parent
-    visible: root.source === ""
-    text: "󰗃"
+    visible: root.source === "" || thumbImage.status === Image.Error
+    text: "\uDB81\uDDC3"  // nf-md-youtube
     color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.35)
     font.family: Style.font.family
     font.pixelSize: Style.font.body

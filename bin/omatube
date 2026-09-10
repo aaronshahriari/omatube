@@ -32,6 +32,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -358,7 +359,12 @@ def pick_thumb(thumbnails):
         return ""
     for name in ("medium", "high", "standard", "default"):
         if name in thumbnails:
-            return thumbnails[name].get("url", "")
+            url = thumbnails[name].get("url", "")
+            # An empty playlist comes back pointing at no_thumbnail.jpg,
+            # which itself 404s. Better to report no thumbnail than to hand
+            # the UI a URL it can only fail to load.
+            if url and "no_thumbnail" not in url:
+                return url
     return ""
 
 
@@ -653,15 +659,80 @@ def cmd_remove(args):
     save_cache(cache)
 
 
-def launch(command):
-    """Detach the player so it outlives this process and the shell."""
-    subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+PLAYER_LOG = os.path.join(STATE_DIR, "player.log")
+
+
+def player_error(binary, code, output):
+    """Pull the one useful line out of a player's death rattle.
+
+    mpv reports a failed yt-dlp resolution as a wall of hook output; the bar
+    has room for a sentence. Prefer the first line that names an error, and
+    strip the "[ytdl_hook] " style prefix that only says where it came from.
+    """
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "ERROR" in line or "error:" in line.lower() or "failed" in line.lower():
+            line = re.sub(r"^\[[^\]]+\]\s*", "", line)
+            line = re.sub(r"^ERROR:\s*", "", line)
+            return "%s: %s" % (binary, line[:200])
+    return "%s exited with status %d" % (binary, code)
+
+
+def launch(command, probe=0.0):
+    """Start the player detached, but notice if it dies on the spot.
+
+    The player has to outlive this process and the shell, so it goes into its
+    own session. That used to mean its output went to /dev/null and a failure
+    — a missing codec, a yt-dlp that cannot resolve the video — was silent:
+    you clicked, nothing played, and nothing said why.
+
+    So output is kept, and for `probe` seconds we watch. A player that is
+    still alive at the end of the window is working and is left alone; one
+    that has already exited non-zero gets its output read back and reported.
+    """
+    binary = command[0]
+    if not shutil.which(binary):
+        raise RuntimeError("%s is not installed" % binary)
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # Truncated per launch, and the mpv path runs at --msg-level=all=error,
+    # so a long film does not quietly write a status line to disk all night.
+    log = open(PLAYER_LOG, "w+", encoding="utf-8", errors="replace")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            # mpv reports errors on stdout, not stderr, so both are kept.
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as error:
+        log.close()
+        raise RuntimeError("could not start %s: %s" % (binary, error))
+
+    if probe <= 0:
+        log.close()
+        return
+
+    deadline = time.time() + probe
+    while time.time() < deadline:
+        code = process.poll()
+        if code is None:
+            time.sleep(0.1)
+            continue
+        if code == 0:
+            # A player that hands off and exits (a browser, a wrapper
+            # script) is a success, not a failure.
+            break
+        log.flush()
+        log.seek(0)
+        output = log.read()
+        log.close()
+        raise RuntimeError(player_error(binary, code, output))
+    log.close()
 
 
 def cmd_play(args):
@@ -677,7 +748,7 @@ def cmd_play(args):
         die("need a video id or --playlist")
 
     if player == "browser":
-        launch(["xdg-open", url])
+        launch(["xdg-open", url], probe=args.probe)
         return
 
     if player == "custom":
@@ -693,18 +764,23 @@ def cmd_play(args):
             ]
         else:
             parts.append(url)
-        launch(parts)
+        launch(parts, probe=args.probe)
         return
 
-    # mpv reads YouTube through yt-dlp. --ytdl-format keeps the stream to a
-    # single pre-muxed file where one exists, which starts playing quicker
-    # than fetching separate video and audio tracks.
+    # mpv reads YouTube through yt-dlp.
+    #
+    # No --ytdl-format here on purpose: quality is a standing preference and
+    # belongs in the user's own mpv.conf, which an override from a playlist
+    # widget has no business quietly beating.
+    #
+    # --msg-level keeps mpv's per-frame status line out of the log launch()
+    # is holding open, while leaving real errors in it to be reported.
     launch([
         "mpv",
-        "--ytdl-format=bestvideo[height<=?1080]+bestaudio/best",
+        "--msg-level=all=error",
         "--force-window=immediate",
         url,
-    ])
+    ], probe=args.probe)
 
 
 def cmd_open(args):
@@ -751,6 +827,8 @@ def build_parser():
     play.add_argument("--playlist", default="", help="play a whole playlist")
     play.add_argument("--player", default="", choices=["", "mpv", "browser", "custom"])
     play.add_argument("--command", default="", help="custom player command")
+    play.add_argument("--probe", type=float, default=8.0,
+                      help="seconds to watch for an immediate failure (0 disables)")
     play.set_defaults(run=cmd_play)
 
     open_cmd = sub.add_parser("open", help="open on youtube.com")

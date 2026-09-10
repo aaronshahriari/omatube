@@ -6,6 +6,11 @@ import "Model.js" as Model
 // One video in a playlist: thumbnail, title, channel and length, plus the
 // two actions worth a click — play it, or drop it from the list.
 //
+// Icons are written as \u escapes rather than literal glyphs: a raw
+// private-use-area character does not survive every editor, shell and patch
+// tool that touches this file, and when one is silently dropped the button
+// renders as an invisible blank that is still clickable.
+//
 // The action buttons only appear on hover or under the keyboard cursor. A
 // remove button sitting permanently beside every row invites the misclick
 // it cannot take back.
@@ -117,7 +122,7 @@ Item {
     Behavior on opacity { NumberAnimation { duration: 90 } }
 
     PanelActionButton {
-      iconText: ""
+      iconText: "\uDB81\uDC0A"  // nf-md-play
       tooltipText: "Play"
       foreground: root.foreground
       // A video YouTube will not serve cannot be played; removing it is
@@ -128,7 +133,7 @@ Item {
     }
 
     PanelActionButton {
-      iconText: "󰖟"
+      iconText: "\uDB81\uDD9F"  // nf-md-open-in-new
       tooltipText: "Open on youtube.com"
       foreground: root.foreground
       visible: root.available
@@ -136,7 +141,7 @@ Item {
     }
 
     PanelActionButton {
-      iconText: "󰩹"
+      iconText: "\uDB82\uDE79"  // nf-md-trash-can-outline
       tooltipText: "Remove from playlist"
       foreground: root.foreground
       hoverColor: root.urgent
