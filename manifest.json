@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "aaronshahriari.omatube",
+  "name": "OmaTube",
+  "version": "0.1.0",
+  "author": "Aaron Shahriari",
+  "description": "Your YouTube playlists in the bar — open one, play a video in mpv or the browser, drop it from the list without leaving the desktop",
+  "kinds": [
+    "bar-widget",
+    "service",
+    "overlay"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml",
+    "overlay": "Overlay.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaTube",
+    "description": "Playlists, and the videos inside them, one click from the bar",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "player": "mpv",
+      "playerCommand": "",
+      "barLabel": "Icon",
+      "maxVideos": 40,
+      "confirmRemove": true,
+      "syncInterval": "30 minutes"
+    },
+    "schema": [
+      {
+        "key": "player",
+        "type": "enum",
+        "label": "Play videos with",
+        "description": "mpv streams through yt-dlp with no browser and no ads. Browser hands the watch URL to your default handler. Custom runs the command below.",
+        "options": [
+          "mpv",
+          "browser",
+          "custom"
+        ],
+        "defaultValue": "mpv"
+      },
+      {
+        "key": "playerCommand",
+        "type": "string",
+        "label": "Custom player command",
+        "description": "Used only when the player is Custom. {url} becomes the watch URL and {id} the video id — e.g. `freetube {url}`. Without a placeholder the URL is appended.",
+        "defaultValue": ""
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Bar label",
+        "description": "Icon shows the glyph alone. Playlists shows how many you have. Videos shows the total across every playlist.",
+        "options": [
+          "Icon",
+          "Playlists",
+          "Videos"
+        ],
+        "defaultValue": "Icon"
+      },
+      {
+        "key": "maxVideos",
+        "type": "integer",
+        "label": "Max videos listed",
+        "description": "Per playlist, in the bar popup. The fullscreen view always shows everything.",
+        "min": 5,
+        "max": 200,
+        "step": 5,
+        "defaultValue": 40
+      },
+      {
+        "key": "confirmRemove",
+        "type": "boolean",
+        "label": "Confirm before removing",
+        "description": "Off makes removal one click, undoable for a few seconds from the row it left behind.",
+        "defaultValue": true
+      },
+      {
+        "key": "syncInterval",
+        "type": "enum",
+        "label": "Background sync",
+        "description": "How often the playlist list refreshes on its own. Opening the panel always syncs, so this only governs the idle case.",
+        "options": [
+          "15 minutes",
+          "30 minutes",
+          "1 hour",
+          "Only when opened"
+        ],
+        "defaultValue": "30 minutes"
+      }
+    ]
+  }
+}

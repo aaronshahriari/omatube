@@ -1,0 +1,788 @@
+#!/usr/bin/env python3
+"""YouTube playlist client for the OmaTube Omarchy shell plugin.
+
+The shell never talks to YouTube. This CLI owns the OAuth credentials and
+every request; the QML reads the JSON cache it writes and shells back out
+for anything that mutates a playlist. That keeps a long-lived refresh token
+out of the shell process — which loads third-party plugin code unsandboxed —
+and makes every write a single auditable command you can also run by hand.
+
+Commands:
+  setup                  print what to create in Google Cloud, and why
+  login                  run the OAuth flow and store a refresh token
+  logout                 forget the stored credentials
+  status                 one line of JSON: signed in, cached, stale
+  sync                   refresh the playlist list into the cache
+  items <playlistId>     refresh one playlist's videos into the cache
+  play <videoId>         hand a video to the configured player
+  open <videoId>         open the watch page in the browser
+  remove <playlistItemId>  delete one video from its playlist
+
+Everything reads and writes two files:
+  ~/.local/state/omarchy/omatube/token.json   credentials, mode 0600
+  ~/.local/state/omarchy/omatube/data.json    the cache the shell renders
+"""
+
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+API = "https://www.googleapis.com/youtube/v3"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+# playlistItems.delete is the reason this is the full manage scope rather
+# than youtube.readonly. Removing a video is half the point of the plugin.
+SCOPE = "https://www.googleapis.com/auth/youtube"
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")),
+    "omarchy", "omatube",
+)
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
+    "omarchy", "omatube",
+)
+TOKEN_PATH = os.path.join(STATE_DIR, "token.json")
+DATA_PATH = os.path.join(STATE_DIR, "data.json")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+WATCH_URL = "https://www.youtube.com/watch?v="
+LIST_URL = "https://www.youtube.com/playlist?list="
+
+USER_AGENT = "omatube/0.1 (+https://github.com/aaronshahriari/omatube)"
+
+
+# ---- small io helpers ------------------------------------------------------
+
+
+def die(message, code=1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def write_json(path, payload, mode=0o644):
+    """Write atomically.
+
+    The shell watches data.json with a FileView and reloads on change. A
+    partial write there is a parse error in the bar, so the file is only
+    ever swapped in complete.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def read_json(path, fallback=None):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {} if fallback is None else fallback
+
+
+def load_config():
+    """Player settings for standalone use.
+
+    Inside the shell the plugin's settings live inline in shell.json and
+    arrive as flags, so this only matters when you run the CLI yourself.
+    """
+    config = read_json(CONFIG_PATH)
+    return {
+        "player": config.get("player", "mpv"),
+        "playerCommand": config.get("playerCommand", ""),
+    }
+
+
+# ---- credentials -----------------------------------------------------------
+
+
+def load_token():
+    return read_json(TOKEN_PATH)
+
+
+def save_token(token):
+    write_json(TOKEN_PATH, token, mode=0o600)
+
+
+class AuthRequired(Exception):
+    """No usable credentials. The UI turns this into a connect prompt."""
+
+
+def access_token():
+    """Return a live access token, refreshing it if it has expired."""
+    token = load_token()
+    if not token.get("refresh_token"):
+        raise AuthRequired("not signed in — run `omatube login`")
+
+    # 60s of slack so a token that expires mid-request is refreshed first.
+    if token.get("access_token") and token.get("expires_at", 0) > time.time() + 60:
+        return token["access_token"]
+
+    payload = urllib.parse.urlencode({
+        "client_id": token.get("client_id", ""),
+        "client_secret": token.get("client_secret", ""),
+        "refresh_token": token["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+
+    try:
+        fresh = http_json(TOKEN_URL, data=payload, method="POST")
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        # invalid_grant means the refresh token is dead: revoked, expired
+        # after inactivity, or the OAuth client was deleted. Nothing here
+        # can recover it, so drop it and ask for a fresh sign-in.
+        if "invalid_grant" in body:
+            raise AuthRequired("sign-in expired — run `omatube login` again")
+        raise
+
+    token["access_token"] = fresh["access_token"]
+    token["expires_at"] = time.time() + int(fresh.get("expires_in", 3600))
+    save_token(token)
+    return token["access_token"]
+
+
+# ---- http ------------------------------------------------------------------
+
+
+def http_json(url, data=None, method="GET", headers=None, timeout=20):
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("User-Agent", USER_AGENT)
+    if data is not None:
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    return json.loads(raw) if raw else {}
+
+
+def api(path, params=None, method="GET"):
+    """One YouTube Data API call, with the bearer token attached."""
+    url = API + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    headers = {"Authorization": "Bearer " + access_token()}
+    try:
+        return http_json(url, method=method, headers=headers)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        raise RuntimeError(api_error_message(error.code, body)) from None
+
+
+def api_error_message(code, body):
+    """Turn Google's error envelope into something a bar tooltip can hold."""
+    reason, message = "", ""
+    try:
+        detail = json.loads(body).get("error", {})
+        message = detail.get("message", "")
+        errors = detail.get("errors") or []
+        if errors:
+            reason = errors[0].get("reason", "")
+    except ValueError:
+        pass
+
+    if reason == "quotaExceeded":
+        return "YouTube API quota exhausted for today"
+    if code == 403 and reason in ("forbidden", "playlistOperationUnsupported"):
+        # Watch Later and History are the usual offenders: Google closed
+        # them to the API in 2016 and they cannot be edited this way.
+        return message or "YouTube refused that operation on this playlist"
+    if code == 404:
+        return "not found — the playlist or video may already be gone"
+    return message or ("YouTube API error %d" % code)
+
+
+# ---- oauth -----------------------------------------------------------------
+
+
+SUCCESS_PAGE = b"""<!doctype html><meta charset=utf-8>
+<title>OmaTube connected</title>
+<style>body{font:16px system-ui;margin:12vh auto;max-width:28rem;text-align:center;
+color:#cacccc;background:#101315}code{color:#8fb573}</style>
+<h1>Connected</h1><p>OmaTube can read your playlists now.</p>
+<p>Close this tab and head back to the bar.</p>"""
+
+FAILURE_PAGE = b"""<!doctype html><meta charset=utf-8>
+<title>OmaTube</title>
+<style>body{font:16px system-ui;margin:12vh auto;max-width:28rem;text-align:center;
+color:#cacccc;background:#101315}</style>
+<h1>Sign-in failed</h1><p>Nothing was saved. Run <code>omatube login</code> again.</p>"""
+
+
+class CallbackHandler(http.server.BaseHTTPRequestHandler):
+    """Catches Google's redirect back to the loopback address."""
+
+    result = None
+
+    def do_GET(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        CallbackHandler.result = query
+        ok = "code" in query
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(SUCCESS_PAGE if ok else FAILURE_PAGE)
+
+    def log_message(self, *_args):
+        """Silence the default stderr access log; it is not ours to print."""
+
+
+def oauth_login(client_id, client_secret):
+    # PKCE on top of the client secret. A desktop client's secret is not
+    # actually secret — it ships on every machine — so the verifier is what
+    # really binds this code exchange to this process.
+    verifier = base64.urlsafe_b64encode(os.urandom(64)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).decode().rstrip("=")
+    state = secrets.token_urlsafe(24)
+
+    # Port 0 lets the OS pick. Google allows any port on the loopback
+    # address for desktop clients, so nothing has to be registered.
+    server = http.server.HTTPServer(("127.0.0.1", 0), CallbackHandler)
+    redirect_uri = "http://127.0.0.1:%d" % server.server_port
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": SCOPE,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        # offline + consent is what actually returns a refresh token. Without
+        # prompt=consent Google omits it on every sign-in after the first,
+        # which strands the plugin the moment the access token expires.
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    url = AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+    print("Opening your browser to approve OmaTube.", file=sys.stderr)
+    print("If nothing opens, visit:\n\n  %s\n" % url, file=sys.stderr)
+
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    thread.join(timeout=300)
+    server.server_close()
+
+    query = CallbackHandler.result
+    if not query:
+        die("timed out waiting for the browser (5 minutes)")
+    if "code" not in query:
+        die("sign-in was declined: " + query.get("error", ["unknown"])[0])
+    if query.get("state", [""])[0] != state:
+        die("state mismatch — sign-in aborted")
+
+    payload = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": query["code"][0],
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    }).encode()
+
+    try:
+        token = http_json(TOKEN_URL, data=payload, method="POST")
+    except urllib.error.HTTPError as error:
+        die("token exchange failed: " + error.read().decode("utf-8", "replace"))
+
+    if not token.get("refresh_token"):
+        die("Google returned no refresh token — revoke OmaTube's access at "
+            "https://myaccount.google.com/permissions and try again")
+
+    save_token({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": token["refresh_token"],
+        "access_token": token.get("access_token", ""),
+        "expires_at": time.time() + int(token.get("expires_in", 3600)),
+    })
+
+
+# ---- parsing ---------------------------------------------------------------
+
+
+DURATION_RE = re.compile(
+    r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?"
+)
+
+
+def duration_seconds(iso):
+    """PT1H2M3S -> 3723. Live streams report P0D and come back as 0."""
+    match = DURATION_RE.fullmatch(iso or "")
+    if not match:
+        return 0
+    days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def format_duration(seconds):
+    if seconds <= 0:
+        return ""
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%d:%02d" % (minutes, secs)
+
+
+def pick_thumb(thumbnails):
+    """Prefer medium; it is 320px, which is what the grid draws."""
+    if not thumbnails:
+        return ""
+    for name in ("medium", "high", "standard", "default"):
+        if name in thumbnails:
+            return thumbnails[name].get("url", "")
+    return ""
+
+
+def paged(path, params, cap=None):
+    """Walk pageToken until YouTube stops handing them out."""
+    out, token = [], None
+    while True:
+        page = dict(params)
+        if token:
+            page["pageToken"] = token
+        response = api(path, page)
+        out.extend(response.get("items", []))
+        token = response.get("nextPageToken")
+        if not token or (cap and len(out) >= cap):
+            return out[:cap] if cap else out
+
+
+# ---- cache -----------------------------------------------------------------
+
+
+def empty_cache():
+    return {
+        "syncedAt": 0,
+        "authRequired": False,
+        "error": "",
+        "channel": "",
+        "playlists": [],
+        "items": {},
+        "itemsSyncedAt": {},
+    }
+
+
+def load_cache():
+    cache = read_json(DATA_PATH)
+    base = empty_cache()
+    base.update(cache if isinstance(cache, dict) else {})
+    return base
+
+
+def save_cache(cache):
+    write_json(DATA_PATH, cache)
+
+
+def record_failure(error):
+    """Persist a failure without destroying what is already cached.
+
+    A network blip should leave yesterday's playlists on screen with a
+    note, not blank the panel.
+    """
+    cache = load_cache()
+    cache["error"] = str(error)
+    cache["authRequired"] = isinstance(error, AuthRequired)
+    save_cache(cache)
+
+
+# ---- commands --------------------------------------------------------------
+
+
+def cmd_setup(_args):
+    print("""OmaTube talks to YouTube through the official Data API, which
+means you need your own OAuth client. It is free and takes about two minutes.
+Removing a video from a playlist is a write, and the API is the only way to
+do it — yt-dlp can read playlists but cannot edit them.
+
+You create the client rather than OmaTube shipping one, because a shared
+client would put every user's quota in one bucket and would be revoked by
+Google the moment it appeared in a public repo.
+
+  1. Open https://console.cloud.google.com/projectcreate and make a project.
+
+  2. Enable the API for it:
+     https://console.cloud.google.com/apis/library/youtube.googleapis.com
+
+  3. Configure the consent screen (APIs & Services > OAuth consent screen).
+     Pick External, fill in the name and your own email, and save. Leave it
+     in Testing mode and add your own Google account under Test users —
+     a personal tool never needs verification.
+
+  4. APIs & Services > Credentials > Create credentials > OAuth client ID.
+     Application type: Desktop app. Copy the client ID and client secret.
+
+  5. Sign in:
+
+       omatube login --client-id XXXX --client-secret YYYY
+
+Your browser opens once. The refresh token lands in
+  %s
+with mode 0600, and nothing is sent anywhere except googleapis.com.
+
+Note: Watch Later and History are not reachable through the API — Google
+closed them in 2016 — so they will not appear. Everything else will.""" % TOKEN_PATH)
+
+
+def cmd_login(args):
+    client_id = args.client_id
+    client_secret = args.client_secret
+
+    # The panel writes a file rather than passing a secret on a command
+    # line, where it would sit in the process table for anyone to read.
+    if args.client_file:
+        # The shell's FileView saves asynchronously, so the file can still
+        # be missing for a moment after the panel asks us to read it.
+        deadline = time.time() + 5
+        while not os.path.exists(args.client_file) and time.time() < deadline:
+            time.sleep(0.05)
+
+        pasted = read_json(args.client_file)
+        # The secret is now in the token store; leave no second copy behind.
+        try:
+            os.remove(args.client_file)
+        except OSError:
+            pass
+        if not pasted:
+            # Also accept the credentials JSON downloaded from the console
+            # verbatim, which nests everything under "installed".
+            die("no client id/secret in %s — expected JSON with client_id "
+                "and client_secret (see `omatube setup`)" % args.client_file)
+        block = pasted.get("installed") or pasted.get("web") or pasted
+        client_id = block.get("client_id", "")
+        client_secret = block.get("client_secret", "")
+
+    if not client_id or not client_secret:
+        die("need --client-id and --client-secret (see `omatube setup`)")
+
+    oauth_login(client_id.strip(), client_secret.strip())
+    # A sign-in that leaves the panel empty looks like a failed sign-in, so
+    # fetch the playlists before reporting success.
+    sync(force=True)
+    print("connected", file=sys.stderr)
+
+
+def cmd_logout(_args):
+    for path in (TOKEN_PATH, DATA_PATH):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    save_cache(empty_cache())
+    print("signed out", file=sys.stderr)
+
+
+def cmd_status(_args):
+    cache = load_cache()
+    print(json.dumps({
+        "signedIn": bool(load_token().get("refresh_token")),
+        "syncedAt": cache["syncedAt"],
+        "playlists": len(cache["playlists"]),
+        "error": cache["error"],
+    }))
+
+
+def sync(force=True, max_age=0):
+    cache = load_cache()
+    if not force and max_age and time.time() - cache["syncedAt"] < max_age:
+        return cache
+
+    channel = api("/channels", {"part": "snippet", "mine": "true"})
+    channel_items = channel.get("items") or []
+    title = channel_items[0]["snippet"]["title"] if channel_items else ""
+
+    raw = paged("/playlists", {
+        "part": "snippet,contentDetails,status",
+        "mine": "true",
+        "maxResults": 50,
+    })
+
+    playlists = []
+    for entry in raw:
+        snippet = entry.get("snippet", {})
+        playlists.append({
+            "id": entry["id"],
+            "title": snippet.get("title", "Untitled"),
+            "count": entry.get("contentDetails", {}).get("itemCount", 0),
+            "thumb": pick_thumb(snippet.get("thumbnails")),
+            "privacy": entry.get("status", {}).get("privacyStatus", ""),
+            "updatedAt": snippet.get("publishedAt", ""),
+        })
+
+    cache["channel"] = title
+    cache["playlists"] = playlists
+    cache["syncedAt"] = int(time.time())
+    cache["error"] = ""
+    cache["authRequired"] = False
+
+    # Drop cached videos for playlists that no longer exist, so the file
+    # does not grow forever as playlists come and go.
+    live = {playlist["id"] for playlist in playlists}
+    cache["items"] = {k: v for k, v in cache["items"].items() if k in live}
+    cache["itemsSyncedAt"] = {
+        k: v for k, v in cache["itemsSyncedAt"].items() if k in live
+    }
+
+    save_cache(cache)
+    return cache
+
+
+def cmd_sync(args):
+    sync(force=not args.max_age, max_age=args.max_age)
+
+
+def fetch_items(playlist_id, cap=None):
+    entries = paged("/playlistItems", {
+        "part": "snippet,contentDetails,status",
+        "playlistId": playlist_id,
+        "maxResults": 50,
+    }, cap=cap)
+
+    videos = []
+    for entry in entries:
+        snippet = entry.get("snippet", {})
+        video_id = snippet.get("resourceId", {}).get("videoId", "")
+        privacy = entry.get("status", {}).get("privacyStatus", "")
+        title = snippet.get("title", "")
+        # A video that was deleted or made private still occupies a row,
+        # with a placeholder title and no thumbnail. Marking it lets the
+        # panel offer the only useful action left: removing it.
+        available = privacy not in ("private", "privacyStatusUnspecified") \
+            and title not in ("Private video", "Deleted video")
+        videos.append({
+            "itemId": entry["id"],
+            "videoId": video_id,
+            "title": title or "Unavailable video",
+            "channel": snippet.get("videoOwnerChannelTitle", ""),
+            "thumb": pick_thumb(snippet.get("thumbnails")),
+            "position": snippet.get("position", 0),
+            "available": available,
+            "seconds": 0,
+            "duration": "",
+        })
+
+    # Durations live on the videos resource, not on playlistItems. Fifty
+    # ids per call at one quota unit each makes this nearly free.
+    ids = [video["videoId"] for video in videos if video["videoId"] and video["available"]]
+    lengths = {}
+    for start in range(0, len(ids), 50):
+        batch = api("/videos", {
+            "part": "contentDetails",
+            "id": ",".join(ids[start:start + 50]),
+        })
+        for entry in batch.get("items", []):
+            lengths[entry["id"]] = duration_seconds(
+                entry.get("contentDetails", {}).get("duration", "")
+            )
+
+    for video in videos:
+        seconds = lengths.get(video["videoId"], 0)
+        video["seconds"] = seconds
+        video["duration"] = format_duration(seconds)
+
+    return videos
+
+
+def cmd_items(args):
+    cache = load_cache()
+    fresh_enough = (
+        args.max_age
+        and time.time() - cache["itemsSyncedAt"].get(args.playlist_id, 0) < args.max_age
+    )
+    if fresh_enough:
+        return
+
+    videos = fetch_items(args.playlist_id, cap=args.limit)
+    cache["items"][args.playlist_id] = videos
+    cache["itemsSyncedAt"][args.playlist_id] = int(time.time())
+    cache["error"] = ""
+    save_cache(cache)
+
+    if args.json:
+        print(json.dumps(videos))
+
+
+def cmd_playlists(args):
+    cache = sync(force=False, max_age=args.max_age) if args.refresh else load_cache()
+    print(json.dumps(cache["playlists"]))
+
+
+def cmd_remove(args):
+    api("/playlistItems", {"id": args.item_id}, method="DELETE")
+
+    # Drop the row locally too. Waiting on the next sync would leave a
+    # deleted video on screen, and YouTube's list endpoint is eventually
+    # consistent enough that an immediate re-fetch can still return it.
+    cache = load_cache()
+    for playlist_id, videos in cache["items"].items():
+        kept = [video for video in videos if video["itemId"] != args.item_id]
+        if len(kept) != len(videos):
+            cache["items"][playlist_id] = kept
+            for playlist in cache["playlists"]:
+                if playlist["id"] == playlist_id:
+                    playlist["count"] = max(0, playlist["count"] - 1)
+            break
+    save_cache(cache)
+
+
+def launch(command):
+    """Detach the player so it outlives this process and the shell."""
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def cmd_play(args):
+    config = load_config()
+    player = args.player or config["player"]
+    custom = args.command or config["playerCommand"]
+
+    if args.playlist:
+        url = LIST_URL + args.playlist
+    elif args.video_id:
+        url = WATCH_URL + args.video_id
+    else:
+        die("need a video id or --playlist")
+
+    if player == "browser":
+        launch(["xdg-open", url])
+        return
+
+    if player == "custom":
+        if not custom.strip():
+            die("player is 'custom' but no command is configured")
+        parts = shlex.split(custom)
+        # {url}/{id} anywhere in the command, else the URL is appended —
+        # which is what almost every video player expects anyway.
+        if any("{url}" in part or "{id}" in part for part in parts):
+            parts = [
+                part.replace("{url}", url).replace("{id}", args.video_id or "")
+                for part in parts
+            ]
+        else:
+            parts.append(url)
+        launch(parts)
+        return
+
+    # mpv reads YouTube through yt-dlp. --ytdl-format keeps the stream to a
+    # single pre-muxed file where one exists, which starts playing quicker
+    # than fetching separate video and audio tracks.
+    launch([
+        "mpv",
+        "--ytdl-format=bestvideo[height<=?1080]+bestaudio/best",
+        "--force-window=immediate",
+        url,
+    ])
+
+
+def cmd_open(args):
+    launch(["xdg-open", LIST_URL + args.playlist if args.playlist else WATCH_URL + args.video_id])
+
+
+# ---- entry point -----------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="omatube", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("setup", help="how to create the OAuth client").set_defaults(run=cmd_setup)
+
+    login = sub.add_parser("login", help="run the OAuth flow")
+    login.add_argument("--client-id", default="")
+    login.add_argument("--client-secret", default="")
+    login.add_argument("--client-file", default="", help="JSON with client_id/client_secret")
+    login.set_defaults(run=cmd_login)
+
+    sub.add_parser("logout", help="forget stored credentials").set_defaults(run=cmd_logout)
+    sub.add_parser("status", help="one line of JSON").set_defaults(run=cmd_status)
+
+    sync_cmd = sub.add_parser("sync", help="refresh the playlist list")
+    sync_cmd.add_argument("--max-age", type=int, default=0,
+                          help="skip if the cache is younger than N seconds")
+    sync_cmd.set_defaults(run=cmd_sync)
+
+    items = sub.add_parser("items", help="refresh one playlist's videos")
+    items.add_argument("playlist_id")
+    items.add_argument("--max-age", type=int, default=0)
+    items.add_argument("--limit", type=int, default=0)
+    items.add_argument("--json", action="store_true")
+    items.set_defaults(run=cmd_items)
+
+    playlists = sub.add_parser("playlists", help="print the cached playlists")
+    playlists.add_argument("--refresh", action="store_true")
+    playlists.add_argument("--max-age", type=int, default=300)
+    playlists.set_defaults(run=cmd_playlists)
+
+    play = sub.add_parser("play", help="hand a video to the player")
+    play.add_argument("video_id", nargs="?", default="")
+    play.add_argument("--playlist", default="", help="play a whole playlist")
+    play.add_argument("--player", default="", choices=["", "mpv", "browser", "custom"])
+    play.add_argument("--command", default="", help="custom player command")
+    play.set_defaults(run=cmd_play)
+
+    open_cmd = sub.add_parser("open", help="open on youtube.com")
+    open_cmd.add_argument("video_id", nargs="?", default="")
+    open_cmd.add_argument("--playlist", default="")
+    open_cmd.set_defaults(run=cmd_open)
+
+    remove = sub.add_parser("remove", help="delete a video from its playlist")
+    remove.add_argument("item_id", help="playlistItem id, not the video id")
+    remove.set_defaults(run=cmd_remove)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        args.run(args)
+    except AuthRequired as error:
+        record_failure(error)
+        die(str(error), code=2)
+    except urllib.error.URLError as error:
+        # Offline, DNS down, TLS refused. Keep the cache, note it, move on.
+        record_failure(RuntimeError("cannot reach YouTube: %s" % error.reason))
+        die("cannot reach YouTube: %s" % error.reason, code=3)
+    except RuntimeError as error:
+        record_failure(error)
+        die(str(error), code=1)
+    except KeyboardInterrupt:
+        die("interrupted", code=130)
+
+
+if __name__ == "__main__":
+    main()
