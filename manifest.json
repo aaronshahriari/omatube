@@ -4,7 +4,7 @@
   "name": "OmaTube",
   "version": "0.1.0",
   "author": "Aaron Shahriari",
-  "description": "Your YouTube playlists in the bar — open one, play a video in mpv or the browser, drop it from the list without leaving the desktop",
+  "description": "Your YouTube playlists in the bar \u2014 open one, play a video in mpv or the browser, drop it from the list without leaving the desktop",
   "kinds": [
     "bar-widget",
     "service",
@@ -27,7 +27,8 @@
       "barLabel": "Icon",
       "maxVideos": 40,
       "confirmRemove": true,
-      "syncInterval": "30 minutes"
+      "syncInterval": "30 minutes",
+      "skipCookies": true
     },
     "schema": [
       {
@@ -46,8 +47,15 @@
         "key": "playerCommand",
         "type": "string",
         "label": "Custom player command",
-        "description": "Used only when the player is Custom. {url} becomes the watch URL and {id} the video id — e.g. `freetube {url}`. Without a placeholder the URL is appended.",
+        "description": "Used only when the player is Custom. {url} becomes the watch URL and {id} the video id \u2014 e.g. `freetube {url}`. Without a placeholder the URL is appended.",
         "defaultValue": ""
+      },
+      {
+        "key": "skipCookies",
+        "type": "boolean",
+        "label": "Skip browser cookies (faster)",
+        "description": "mpv reads YouTube through yt-dlp. If your mpv.conf sets ytdl-raw-options=cookies-from-browser, yt-dlp re-reads and decrypts the browser cookie database on every launch, which typically costs several seconds per video. On, OmaTube clears that for its own launches only \u2014 mpv started any other way is unaffected. Off follows your mpv.conf, which is slower but keeps Premium bitrate and age-restricted videos.",
+        "defaultValue": true
       },
       {
         "key": "barLabel",

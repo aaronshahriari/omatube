@@ -110,6 +110,9 @@ def load_config():
     return {
         "player": config.get("player", "mpv"),
         "playerCommand": config.get("playerCommand", ""),
+        # "skip" clears a cookies-from-browser setting in the user's
+        # mpv.conf for our launches; "auto" leaves mpv.conf alone.
+        "cookies": config.get("cookies", "skip"),
     }
 
 
@@ -775,12 +778,24 @@ def cmd_play(args):
     #
     # --msg-level keeps mpv's per-frame status line out of the log launch()
     # is holding open, while leaving real errors in it to be reported.
-    launch([
-        "mpv",
-        "--msg-level=all=error",
-        "--force-window=immediate",
-        url,
-    ], probe=args.probe)
+    command = ["mpv", "--msg-level=all=error", "--force-window=immediate"]
+
+    # An mpv.conf carrying `ytdl-raw-options=cookies-from-browser=...` makes
+    # yt-dlp re-read and decrypt the browser's cookie database on every
+    # single launch. Measured on a warm cache that is around 4.5 seconds per
+    # video, to gain the Premium bitrate of a stream that is otherwise the
+    # same resolution, codec and frame rate.
+    #
+    # Clearing the option here affects only the player OmaTube starts; mpv
+    # run any other way still honours the file. Set cookies to "auto" to
+    # follow mpv.conf instead — needed for age-restricted videos, which do
+    # not resolve without a signed-in session.
+    cookies = args.cookies or config["cookies"]
+    if cookies == "skip":
+        command.append("--ytdl-raw-options=")
+
+    command.append(url)
+    launch(command, probe=args.probe)
 
 
 def cmd_open(args):
@@ -827,6 +842,9 @@ def build_parser():
     play.add_argument("--playlist", default="", help="play a whole playlist")
     play.add_argument("--player", default="", choices=["", "mpv", "browser", "custom"])
     play.add_argument("--command", default="", help="custom player command")
+    play.add_argument("--cookies", default="", choices=["", "skip", "auto"],
+                      help="skip clears a cookies-from-browser setting in "
+                           "mpv.conf for this launch; auto follows it")
     play.add_argument("--probe", type=float, default=8.0,
                       help="seconds to watch for an immediate failure (0 disables)")
     play.set_defaults(run=cmd_play)

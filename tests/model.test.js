@@ -155,15 +155,38 @@ test('syncIntervalSeconds maps every option, and 0 means manual', () => {
 // --- commands ------------------------------------------------------------
 
 test('playArgs passes the player through, and the command only for custom', () => {
-  assert.deepEqual(Model.playArgs(video(), 'mpv', ''), ['play', 'vid1', '--player', 'mpv'])
   assert.deepEqual(
-    Model.playArgs(video(), 'custom', 'freetube {url}'),
+    Model.playArgs(video(), 'mpv', '', true),
+    ['play', 'vid1', '--player', 'mpv', '--cookies', 'skip']
+  )
+  assert.deepEqual(
+    Model.playArgs(video(), 'custom', 'freetube {url}', true),
     ['play', 'vid1', '--player', 'custom', '--command', 'freetube {url}']
   )
   // A stale command left over from a previous choice must not ride along.
   assert.deepEqual(
-    Model.playArgs(video(), 'browser', 'freetube {url}'),
+    Model.playArgs(video(), 'browser', 'freetube {url}', true),
     ['play', 'vid1', '--player', 'browser']
+  )
+})
+
+test('--cookies rides along only for mpv, which is the only reader of them', () => {
+  // Passing it to a browser or a custom command would be a flag the CLI
+  // accepts and then has nothing to do with.
+  for (const player of ['browser', 'custom']) {
+    assert.equal(Model.playArgs(video(), player, 'x', true).indexOf('--cookies'), -1)
+  }
+  assert.deepEqual(Model.playerArgs('mpv', '', true).slice(-2), ['--cookies', 'skip'])
+  assert.deepEqual(Model.playerArgs('mpv', '', false).slice(-2), ['--cookies', 'auto'])
+  // Anything other than an explicit false is the fast default, so a missing
+  // setting on a freshly-added widget does not silently cost five seconds.
+  assert.deepEqual(Model.playerArgs('mpv', '', undefined).slice(-2), ['--cookies', 'skip'])
+})
+
+test('playPlaylistArgs carries the same player tail as a single video', () => {
+  assert.deepEqual(
+    Model.playPlaylistArgs({ id: 'PL1' }, 'mpv', '', true),
+    ['play', '--playlist', 'PL1', '--player', 'mpv', '--cookies', 'skip']
   )
 })
 

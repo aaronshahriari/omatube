@@ -83,6 +83,7 @@ In **Setup > Plugins > OmaTube**, or inline on the widget's entry in
 |---|---|---|
 | `player` | `mpv` | `mpv`, `browser`, or `custom` |
 | `playerCommand` | `""` | Used when `player` is `custom`. `{url}` and `{id}` are substituted; with no placeholder the URL is appended |
+| `skipCookies` | `true` | Clears a `cookies-from-browser` setting in your `mpv.conf` for OmaTube's launches only. See below |
 | `barLabel` | `Icon` | `Icon`, `Playlists`, or `Videos` |
 | `maxVideos` | `40` | Cap on rows in the bar popup. The fullscreen view always shows everything |
 | `confirmRemove` | `true` | Off makes removal one click, still undoable |
@@ -94,6 +95,25 @@ preference and belongs in your own `~/.config/mpv/mpv.conf`, not in an
 override from a playlist widget.
 
 Custom examples: `freetube {url}`, `mpv --fs {url}`, `vlc` (URL appended).
+
+### Why mpv starts fast
+
+If your `mpv.conf` sets `ytdl-raw-options=cookies-from-browser=...`, yt-dlp
+re-reads and decrypts the browser's cookie database on **every** launch.
+Measured on one machine, playing the same video:
+
+| | time to first frame | format |
+|---|---|---|
+| `skipCookies: true` (default) | **1.7s** | 1080p60 av01, 207k |
+| following `mpv.conf` | 6.3s | 1080p60 av01, 236k Premium |
+
+Four and a half seconds per video, to gain the Premium bitrate of a stream
+that is otherwise the same resolution, codec and frame rate. So OmaTube
+clears the option by default — for the player it starts, and nothing else.
+mpv run any other way still honours your config.
+
+Set `skipCookies` to `false` if you want it back. You will want it for
+age-restricted videos, which do not resolve without a signed-in session.
 
 ### When a video will not play
 
@@ -141,6 +161,7 @@ omatube sync                     refresh the playlist list into the cache
 omatube items <playlistId>       refresh one playlist's videos
 omatube playlists                print the cached playlists as JSON
 omatube play <videoId> [--player mpv|browser|custom] [--command ...]
+                       [--cookies skip|auto] [--probe SECONDS]
 omatube play --playlist <id>     play the whole playlist
 omatube open <videoId>           open the watch page in the browser
 omatube remove <playlistItemId>  delete a video from its playlist
@@ -149,7 +170,7 @@ omatube remove <playlistItemId>  delete a video from its playlist
 Standalone player settings live in `~/.config/omarchy/omatube/config.json`:
 
 ```json
-{ "player": "mpv", "playerCommand": "" }
+{ "player": "mpv", "playerCommand": "", "cookies": "skip" }
 ```
 
 ## How it fits together

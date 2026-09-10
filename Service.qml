@@ -35,6 +35,7 @@ Item {
 
   readonly property string player: setting("player", "mpv")
   readonly property string playerCommand: setting("playerCommand", "")
+  readonly property bool skipCookies: setting("skipCookies", true) !== false
   readonly property int maxVideos: Math.max(5, parseInt(setting("maxVideos", 40), 10) || 40)
   readonly property bool confirmRemove: setting("confirmRemove", true) !== false
 
@@ -212,7 +213,9 @@ Item {
   // dies immediately, and a removal must not sit behind that window.
 
   property string playError: ""
-  property var playQueue: []
+  // At most one play is ever waiting: it is the latest thing asked for, and
+  // anything older has been superseded rather than stacked up.
+  property var playPending: null
 
   readonly property bool playing: playProc.running
 
@@ -228,10 +231,12 @@ Item {
     }
     onExited: function(code) {
       if (code === 0) root.playError = ""
-      if (root.playQueue.length > 0) {
-        var queued = root.playQueue.slice()
-        var next = queued.shift()
-        root.playQueue = queued
+      if (root.playPending) {
+        var next = root.playPending
+        root.playPending = null
+        // A cancelled probe reports a signal, not a failure of the player it
+        // was watching; do not leave its exit dressed up as an error.
+        root.playError = ""
         playProc.command = [root.cli].concat(next)
         playProc.running = true
       }
@@ -243,8 +248,17 @@ Item {
     // Clearing up front means the panel does not show the previous
     // failure's message while a fresh attempt is still being probed.
     playError = ""
+    // A play that succeeded leaves the CLI watching its player for several
+    // seconds. Queueing behind that would make picking a second video sit and
+    // do nothing for most of that window, so a newer request preempts.
+    //
+    // Cancelling kills only the CLI that was watching: the player it started
+    // is in its own session and plays on. What is lost is the error report
+    // for the first one, which stopped mattering the moment something else
+    // was asked for.
     if (playProc.running) {
-      playQueue = playQueue.concat([args])
+      playPending = args
+      playProc.running = false
       return
     }
     playProc.command = [root.cli].concat(args)
@@ -252,11 +266,11 @@ Item {
   }
 
   function play(video) {
-    runPlay(Model.playArgs(video, player, playerCommand))
+    runPlay(Model.playArgs(video, player, playerCommand, skipCookies))
   }
 
   function playPlaylist(playlist) {
-    runPlay(Model.playPlaylistArgs(playlist, player, playerCommand))
+    runPlay(Model.playPlaylistArgs(playlist, player, playerCommand, skipCookies))
   }
 
   function openInBrowser(video) {

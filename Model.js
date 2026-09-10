@@ -184,20 +184,29 @@ function syncIntervalSeconds(label) {
 // offers is an argv built here. Keeping them in one tested place means a
 // mistyped flag fails a test rather than silently doing nothing on click.
 
-function playArgs(video, player, command) {
-  if (!video || !video.videoId) return null
-  var args = ["play", String(video.videoId)]
+// Shared tail for both play forms: which player, its command when that
+// player is "custom", and whether mpv should skip the browser-cookie lookup.
+function playerArgs(player, command, skipCookies) {
+  var args = []
   if (player) args = args.concat(["--player", String(player)])
   if (player === "custom" && command) args = args.concat(["--command", String(command)])
+  // Only mpv reads cookies through yt-dlp, so the flag is noise anywhere
+  // else and is left off rather than passed and ignored.
+  if (player === "mpv" || !player)
+    args = args.concat(["--cookies", skipCookies === false ? "auto" : "skip"])
   return args
 }
 
-function playPlaylistArgs(playlist, player, command) {
+function playArgs(video, player, command, skipCookies) {
+  if (!video || !video.videoId) return null
+  return ["play", String(video.videoId)]
+    .concat(playerArgs(player, command, skipCookies))
+}
+
+function playPlaylistArgs(playlist, player, command, skipCookies) {
   if (!playlist || !playlist.id) return null
-  var args = ["play", "--playlist", String(playlist.id)]
-  if (player) args = args.concat(["--player", String(player)])
-  if (player === "custom" && command) args = args.concat(["--command", String(command)])
-  return args
+  return ["play", "--playlist", String(playlist.id)]
+    .concat(playerArgs(player, command, skipCookies))
 }
 
 function removeArgs(video) {
@@ -300,6 +309,7 @@ if (typeof module !== "undefined" && module.exports) {
     barLabelDescription: barLabelDescription,
     barLabel: barLabel,
     syncIntervalSeconds: syncIntervalSeconds,
+    playerArgs: playerArgs,
     playArgs: playArgs,
     playPlaylistArgs: playPlaylistArgs,
     removeArgs: removeArgs,
