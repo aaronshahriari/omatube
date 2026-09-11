@@ -1,6 +1,5 @@
 import QtQuick
 import Quickshell
-import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
@@ -25,7 +24,7 @@ Item {
   property var shell: null
   property var manifest: null
 
-  readonly property string pluginId: (manifest && manifest.id) || "aaronshahriari.omatube"
+  readonly property string pluginId: (manifest && manifest.id) || "io.github.aaronshahriari.omatube"
 
   property bool opened: false
 

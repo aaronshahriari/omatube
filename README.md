@@ -18,12 +18,26 @@ Two surfaces, one cache:
 omarchy plugin add https://github.com/aaronshahriari/omatube.git --enable --yes
 ```
 
-Or by hand: clone into `~/.config/omarchy/plugins/aaronshahriari.omatube/`,
+Or by hand: clone into `~/.config/omarchy/plugins/io.github.aaronshahriari.omatube/`,
 then `omarchy-shell shell rescanPlugins` and
-`omarchy plugin enable aaronshahriari.omatube`.
+`omarchy plugin enable io.github.aaronshahriari.omatube`.
 
 There is no build step. The CLI is a single Python 3 file using nothing but
 the standard library.
+
+### Requirements
+
+| | | |
+|---|---|---|
+| Omarchy | the Quattro shell | the plugin host |
+| `python3` | 3.8 or newer | `bin/omatube`, no third-party packages |
+| `mpv` + `yt-dlp` | optional | only if you keep the default player |
+| `xdg-open` | | the OAuth approval page, and "open on youtube.com" |
+| A Google account | | and your own OAuth client, see below |
+
+Nothing is installed for you, and there is no post-install script, service
+unit or remote build. If mpv is missing, set `player` to `browser` and the
+plugin needs nothing beyond Python.
 
 ## Connect it
 
@@ -31,7 +45,7 @@ OmaTube talks to YouTube through the official Data API, so it needs its own
 OAuth client. It is free and takes about two minutes:
 
 ```bash
-~/.config/omarchy/plugins/aaronshahriari.omatube/bin/omatube setup
+~/.config/omarchy/plugins/io.github.aaronshahriari.omatube/bin/omatube setup
 ```
 
 That prints the exact steps. In short: make a Google Cloud project, enable the
@@ -173,6 +187,40 @@ Standalone player settings live in `~/.config/omarchy/omatube/config.json`:
 { "player": "mpv", "playerCommand": "", "cookies": "skip" }
 ```
 
+## What it touches
+
+Omarchy plugins share the shell process and run unsandboxed with your user
+permissions, so here is the whole footprint.
+
+**Network.** `bin/omatube` and nothing else. It talks to
+`accounts.google.com` and `oauth2.googleapis.com` to sign you in, and to
+`www.googleapis.com/youtube/v3` for your playlists. The QML never opens a
+socket. There is no telemetry, no analytics and no server of mine anywhere
+in the path.
+
+**Files.**
+
+| Path | | What |
+|---|---|---|
+| `~/.local/state/omarchy/omatube/token.json` | written, `0600` | your refresh token and OAuth client |
+| `~/.local/state/omarchy/omatube/data.json` | written | the playlist cache |
+| `~/.local/state/omarchy/omatube/player.log` | written | output of the last launch, for when a play fails |
+| `~/.config/omarchy/omatube/config.json` | read only | standalone CLI player settings, if you write one |
+
+Nothing else is written anywhere. Your `mpv.conf` is read by mpv, never by
+OmaTube.
+
+**Processes.** `xdg-open`, and your chosen player — `mpv`, or whatever
+`playerCommand` names. Launched detached, watched for a few seconds so a
+failure can be reported, then let go. No second Quickshell process is ever
+started.
+
+**Account access.** The OAuth scope is `youtube`, which is read and write:
+write is what makes "remove from playlist" possible. `omatube logout`
+deletes the local token and cache. Revoking the grant itself is done at
+Google's end, at
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+
 ## How it fits together
 
 ```
@@ -197,11 +245,34 @@ auditable command you can also run by hand.
 panel, a two-display desktop would run two sync timers and commit each held
 removal twice.
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.aaronshahriari.omatube
+```
+
+That takes the widget out of the bar and deletes the plugin folder. It does
+not touch your token or cache, so a reinstall picks up where you left off.
+To go the rest of the way, before removing the plugin:
+
+```bash
+~/.config/omarchy/plugins/io.github.aaronshahriari.omatube/bin/omatube logout
+rm -rf ~/.local/state/omarchy/omatube ~/.config/omarchy/omatube
+```
+
+`logout` only deletes the local token — the grant on Google's side is yours
+to revoke, at
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+Do that whether or not you get to `logout` first; deleting the plugin folder
+alone leaves both the grant and the token behind.
+
 ## Development
 
 ```bash
-node --test tests/          # pure logic in Model.js
+node --test tests/*.test.js    # pure logic in Model.js
 python3 -m py_compile bin/omatube
+omarchy plugin validate .
+qmllint -I "$OMARCHY_PATH/shell" *.qml
 ```
 
 `Model.js` holds everything that is data in, data out — cache shape, search,

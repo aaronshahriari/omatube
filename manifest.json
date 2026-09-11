@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "aaronshahriari.omatube",
+  "id": "io.github.aaronshahriari.omatube",
   "name": "OmaTube",
   "version": "0.1.0",
   "author": "Aaron Shahriari",
+  "license": "MIT",
   "description": "Your YouTube playlists in the bar \u2014 open one, play a video in mpv or the browser, drop it from the list without leaving the desktop",
   "kinds": [
     "bar-widget",

@@ -1,6 +1,4 @@
 import QtQuick
-import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -16,8 +14,8 @@ import "Model.js" as Model
 // auditable command.
 Panel {
   id: root
-  moduleName: "aaronshahriari.omatube"
-  ipcTarget: "aaronshahriari.omatube"
+  moduleName: "io.github.aaronshahriari.omatube"
+  ipcTarget: "io.github.aaronshahriari.omatube"
   manageIpc: false
 
   property var anchorItem: null
@@ -30,7 +28,7 @@ Panel {
   // cache, the sync timer, the write queue and the undo window are all
   // single-instance concerns and live in Service.qml; this reads them.
   readonly property var svc: bar && bar.shell && typeof bar.shell.serviceFor === "function"
-    ? bar.shell.serviceFor("aaronshahriari.omatube")
+    ? bar.shell.serviceFor("io.github.aaronshahriari.omatube")
     : null
 
   onSvcChanged: pushSettings()
@@ -142,7 +140,7 @@ Panel {
   function openFullscreen() {
     close()
     if (bar && bar.shell && typeof bar.shell.summon === "function")
-      bar.shell.summon("aaronshahriari.omatube", JSON.stringify({ playlist: selectedId }))
+      bar.shell.summon("io.github.aaronshahriari.omatube", JSON.stringify({ playlist: selectedId }))
   }
 
   // A short travel, not a full-width fly-in: enough to read as direction

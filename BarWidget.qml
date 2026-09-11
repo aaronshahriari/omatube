@@ -9,7 +9,7 @@ import "Model.js" as Model
 // the popup has ever been opened.
 BarWidget {
   id: root
-  moduleName: "aaronshahriari.omatube"
+  moduleName: "io.github.aaronshahriari.omatube"
 
   // nf-md-playlist_play. A bare play triangle reads as "media is playing",
   // which is the media widget's job; the stacked lines say "a list" first.
@@ -24,7 +24,7 @@ BarWidget {
   readonly property string setupIcon: "\uF1E6"  // nf-fa-plug
 
   readonly property var service: bar && bar.shell && typeof bar.shell.serviceFor === "function"
-    ? bar.shell.serviceFor("aaronshahriari.omatube")
+    ? bar.shell.serviceFor("io.github.aaronshahriari.omatube")
     : null
 
   readonly property var cache: service ? service.cache : Model.parseCache("")
@@ -133,7 +133,7 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "aaronshahriari.omatube"
+    target: "io.github.aaronshahriari.omatube"
 
     // Refresh is not a place, so it goes to every instance.
     function sync(): void { root.broadcast("refresh") }
@@ -145,7 +145,7 @@ BarWidget {
     function hide(): void { root.focusedInstance().close() }
     function toggle(): void { root.focusedInstance().togglePanel() }
 
-    // Bindable: `omarchy-shell aaronshahriari.omatube fullscreen` opens the
+    // Bindable: `omarchy-shell io.github.aaronshahriari.omatube fullscreen` opens the
     // grid without going through the bar at all.
     function fullscreen(): void { root.focusedInstance().openFullscreen() }
   }
