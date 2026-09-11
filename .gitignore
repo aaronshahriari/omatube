@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 node_modules/
+
+# Marketplace submission draft, kept for reference, never committed.
+omarchy-plugin-submission.md
