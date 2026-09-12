@@ -37,6 +37,9 @@ def load_cli():
 omatube = load_cli()
 
 
+SCRIPT = "#!/bin/sh\n%s\n"
+
+
 class Body:
     """Enough of an HTTP response to read one."""
 
@@ -191,6 +194,17 @@ class State(unittest.TestCase):
         os.mkdir(self.path("data.json"))
         self.assertEqual(self.dir.read_json("data.json"), {})
 
+    def test_a_symlinked_ancestor_blocks_a_named_file(self):
+        real = os.path.join(self.box, "real")
+        os.makedirs(real)
+        blob = os.path.join(real, "client.json")
+        with io.open(blob, "w") as handle:
+            handle.write('{"client_id": "a"}')
+        os.symlink(real, os.path.join(self.box, "link"))
+        through_link = os.path.join(self.box, "link", "client.json")
+        self.assertEqual(omatube.read_json_at(blob, 1024)["client_id"], "a")
+        self.assertEqual(omatube.read_json_at(through_link, 1024), {})
+
     def test_a_named_file_is_read_and_removed_by_descriptor(self):
         blob = os.path.join(self.box, "client.json")
         with io.open(blob, "w") as handle:
@@ -205,14 +219,138 @@ class State(unittest.TestCase):
         self.assertEqual(omatube.read_json_at(linked, 1024), {})
 
 
+class Walk(unittest.TestCase):
+    """No path is ever resolved in one go, and no component is followed."""
+
+    def setUp(self):
+        self.box = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.box, ignore_errors=True)
+
+    def test_a_symlinked_ancestor_is_refused_not_followed(self):
+        # The guarded component is the leaf; the link is above it, which is
+        # exactly the case O_NOFOLLOW on its own does not cover.
+        real = os.path.join(self.box, "real")
+        os.makedirs(os.path.join(real, "state"))
+        os.symlink(real, os.path.join(self.box, "link"))
+
+        fd = omatube.walk_dir(os.path.join(real, "state"))
+        os.close(fd)
+        with self.assertRaises(omatube.UnsafePath) as caught:
+            omatube.walk_dir(os.path.join(self.box, "link", "state"))
+        self.assertIn("symbolic link", caught.exception.strerror)
+
+    def test_two_runs_starting_at_once_both_get_the_directory(self):
+        made = os.path.join(self.box, "a", "b")
+        first = omatube.walk_dir(made, create=True)
+        second = omatube.walk_dir(made, create=True)
+        try:
+            self.assertEqual(os.fstat(first).st_ino, os.fstat(second).st_ino)
+        finally:
+            os.close(first)
+            os.close(second)
+
+    def test_creating_the_state_directory_walks_rather_than_resolves(self):
+        made = os.path.join(self.box, "a", "b", "c")
+        fd = omatube.walk_dir(made, create=True, mode=0o700)
+        try:
+            self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o700)
+        finally:
+            os.close(fd)
+        # Only the leaf is private; what is above it is an ordinary directory.
+        self.assertEqual(
+            stat.S_IMODE(os.stat(os.path.join(self.box, "a")).st_mode), 0o755)
+
+    def test_a_system_directory_must_be_root_owned_throughout(self):
+        mine = os.path.join(self.box, "bin")
+        os.makedirs(mine)
+        with self.assertRaises(omatube.UnsafePath):
+            omatube.walk_dir(mine, require_uid=0)
+        fd = omatube.walk_dir("/usr/bin", require_uid=0)
+        os.close(fd)
+
+    def test_a_symlinked_system_directory_is_not_a_place_we_look(self):
+        # /bin is a link to usr/bin on a usrmerge system. The walk refuses it
+        # and the next candidate directory is used instead.
+        if os.path.islink("/bin"):
+            with self.assertRaises(omatube.UnsafePath):
+                omatube.walk_dir("/bin", require_uid=0)
+
+
 class Execution(unittest.TestCase):
-    def test_defaults_resolve_to_an_absolute_system_path(self):
-        for name in ("xdg-open",):
-            resolved = omatube.trusted_binary(name)
-            self.assertTrue(os.path.isabs(resolved))
-            self.assertIn(os.path.dirname(resolved), omatube.TRUSTED_BIN_DIRS)
+    def test_a_default_resolves_to_a_verified_descriptor(self):
+        found = omatube.trusted_executable("xdg-open")
+        try:
+            self.assertTrue(os.path.isabs(found.path))
+            self.assertIn(os.path.dirname(found.path), omatube.TRUSTED_BIN_DIRS)
+            info = os.fstat(found.fd)
+            # Everything that was checked was checked on this descriptor, and
+            # this descriptor is what gets executed.
+            self.assertTrue(stat.S_ISREG(info.st_mode))
+            self.assertEqual(info.st_uid, 0)
+            self.assertFalse(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            self.assertEqual(os.readlink("/proc/self/fd/%d" % found.fd),
+                             found.path)
+        finally:
+            found.close()
         with self.assertRaises(RuntimeError):
-            omatube.trusted_binary("definitely-not-installed-xyz")
+            omatube.trusted_executable("definitely-not-installed-xyz")
+
+    def test_the_descriptor_is_what_runs(self):
+        # A binary, and a shebang script, both executed through the
+        # descriptor rather than through a second lookup of the name.
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        stamp = os.path.join(box, "ran")
+        script = os.path.join(box, "probe.sh")
+        with io.open(script, "w") as handle:
+            handle.write(SCRIPT % ('echo "$1" > ' + stamp))
+        os.chmod(script, 0o755)
+
+        fd = os.open(script, os.O_PATH | os.O_NOFOLLOW)
+        omatube.launch([omatube.Executable("/usr/bin/probe", fd), "ran-ok"],
+                       probe=5.0)
+        deadline = time.monotonic() + 5
+        while not os.path.exists(stamp) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with io.open(stamp) as handle:
+            self.assertEqual(handle.read().strip(), "ran-ok")
+
+        # And a real system binary, reported by name when it fails.
+        with self.assertRaises(RuntimeError) as caught:
+            omatube.launch([omatube.trusted_executable("false")], probe=5.0)
+        self.assertIn("false", str(caught.exception))
+        self.assertNotIn("/proc/self/fd", str(caught.exception))
+
+    def test_a_substituted_binary_is_not_the_one_that_runs(self):
+        # Replacing the name after resolution cannot affect the descriptor
+        # already held: the two no longer refer to the same thing.
+        box = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, box, True)
+        stamp = os.path.join(box, "ran")
+        target = os.path.join(box, "prog")
+        with io.open(target, "w") as handle:
+            handle.write(SCRIPT % ("echo original > " + stamp))
+        os.chmod(target, 0o755)
+        fd = os.open(target, os.O_PATH | os.O_NOFOLLOW)
+
+        # Substitution is replacing the file, not rewriting it: a new inode
+        # renamed over the name. (Rewriting the same inode in place is not
+        # something any descriptor scheme can help with, and is not what the
+        # name-then-exec gap allows.)
+        other = os.path.join(box, "swap")
+        with io.open(other, "w") as handle:
+            handle.write(SCRIPT % ("echo substituted > " + stamp))
+        os.chmod(other, 0o755)
+        os.replace(other, target)
+
+        omatube.launch([omatube.Executable(target, fd)], probe=5.0)
+        deadline = time.monotonic() + 5
+        while not os.path.exists(stamp) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with io.open(stamp) as handle:
+            self.assertEqual(handle.read().strip(), "original")
 
     def test_nothing_is_ever_executed_by_bare_name(self):
         with self.assertRaises(RuntimeError) as caught:

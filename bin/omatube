@@ -29,6 +29,7 @@ cannot outlive. See "hard limits" and SafeDir below.
 
 import argparse
 import base64
+import errno
 import hashlib
 import http.server
 import json
@@ -112,6 +113,106 @@ MAX_PLAYER_LOG_BYTES = 256 * 1024        # how much of a player's noise we read
 KILL_GRACE = 3.0                         # TERM, then this long, then KILL
 
 
+# ---- walking to a descriptor -----------------------------------------------
+#
+# O_NOFOLLOW guards the last component of a path and nothing else. A link, or
+# a directory swapped for one, anywhere above it redirects the open before the
+# guarded component is ever reached — and resolving a whole pathname twice
+# (once to check, once to use) is two different lookups whatever flags the
+# second one carries.
+#
+# So nothing below resolves a pathname. Every path is walked from the root one
+# component at a time, each opened relative to the descriptor for the one
+# before it, with O_NOFOLLOW at every step. What comes back is a descriptor,
+# and the descriptor is what is then used — read, written, unlinked, or
+# executed. There is no second lookup for anything to win.
+
+
+class UnsafePath(OSError):
+    """A component of a path was a link, or was not the kind of thing it had
+    to be. Never followed, never repaired — only reported."""
+
+
+def _describe(path, index):
+    parts = [p for p in os.path.abspath(path).split(os.sep) if p]
+    return os.sep + os.sep.join(parts[:index + 1])
+
+
+def walk_dir(path, create=False, mode=0o700, require_uid=None):
+    """A descriptor for a directory, reached without following anything.
+
+    `create` makes missing components as it goes, which is how the state
+    directory comes into being; `require_uid` additionally insists that every
+    component belongs to that user and is not writable by anyone else, which
+    is what "a system directory" has to mean before anything in it is run.
+    """
+    parts = [p for p in os.path.abspath(path).split(os.sep) if p]
+    fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    try:
+        for index, part in enumerate(parts):
+            if part in (os.curdir, os.pardir):
+                raise UnsafePath(errno.EINVAL, "refusing %r in a path" % part)
+            try:
+                nxt = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                # The leaf is the private one; what is above it is ordinary.
+                try:
+                    os.mkdir(part, mode if index == len(parts) - 1 else 0o755,
+                             dir_fd=fd)
+                except FileExistsError:
+                    # Another omatube got there first — the shell can start a
+                    # sync and an items fetch in the same breath. Fall through
+                    # to the open, which is no-follow and settles what it is.
+                    pass
+                nxt = os.open(part, flags, dir_fd=fd)
+            except OSError as error:
+                if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                    # O_DIRECTORY|O_NOFOLLOW reports a link as ENOTDIR, which
+                    # is true but unhelpful. Ask what it actually is, through
+                    # the descriptor we still hold, before saying so.
+                    try:
+                        os.readlink(part, dir_fd=fd)
+                        raise UnsafePath(
+                            errno.ELOOP,
+                            "%s is a symbolic link" % _describe(path, index))
+                    except OSError as inner:
+                        if isinstance(inner, UnsafePath):
+                            raise
+                    raise UnsafePath(
+                        errno.ENOTDIR,
+                        "%s is not a directory" % _describe(path, index))
+                raise
+            os.close(fd)
+            fd = nxt
+
+            if require_uid is not None:
+                info = os.fstat(fd)
+                if info.st_uid != require_uid:
+                    raise UnsafePath(
+                        errno.EPERM,
+                        "%s is not owned by uid %d"
+                        % (_describe(path, index), require_uid))
+                if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise UnsafePath(
+                        errno.EPERM,
+                        "%s is writable by others" % _describe(path, index))
+    except BaseException:
+        os.close(fd)
+        raise
+
+    return fd
+
+
+def split_dir(path):
+    """The parent directory of a path, and the name inside it."""
+    absolute = os.path.abspath(path)
+    return os.path.dirname(absolute), os.path.basename(absolute)
+
+
 # ---- small io helpers ------------------------------------------------------
 
 
@@ -139,11 +240,10 @@ class SafeDir:
 
     def __init__(self, path, create=True, mode=0o700):
         self.path = path
-        if create:
-            os.makedirs(path, mode=mode, exist_ok=True)
-        self.fd = os.open(
-            path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        )
+        # Walked, not resolved: see walk_dir. The descriptor this returns is
+        # the only handle on the directory anything below uses, so the path
+        # is never looked up again after this line.
+        self.fd = walk_dir(path, create=create, mode=mode)
         info = os.fstat(self.fd)
         if info.st_uid != os.getuid():
             die("%s is not owned by you — refusing to use it" % path)
@@ -260,7 +360,16 @@ def state():
     """The state directory, created on first use and then held open."""
     global _state_dir
     if _state_dir is None:
-        _state_dir = SafeDir(STATE_DIR)
+        try:
+            _state_dir = SafeDir(STATE_DIR)
+        except UnsafePath as error:
+            # Naming the component is the whole of the help available here:
+            # a dotfile manager that symlinks part of ~ produces this, and so
+            # does something malicious, and this cannot tell them apart.
+            die("refusing to use %s: %s. Every directory on the way to the "
+                "token must be a real directory owned by you; move or "
+                "replace that link, or point XDG_STATE_HOME somewhere that "
+                "is." % (STATE_DIR, error.strerror))
     return _state_dir
 
 
@@ -278,15 +387,14 @@ def config_dir():
 def read_json_at(path, limit):
     """Read a JSON file the user named, by descriptor.
 
-    Used for --client-file, which can point anywhere, so the parent directory
-    is opened first and the file named relative to it. A symlink at either
-    end is a refusal, not something to follow and find out about later.
+    Used for --client-file, which can point anywhere, so its parent is walked
+    component by component and the file is opened relative to the descriptor
+    that walk ends on. A link anywhere along the way is a refusal, not
+    something to follow and find out about afterwards.
     """
-    directory, name = os.path.split(os.path.abspath(path))
+    directory, name = split_dir(path)
     try:
-        dir_fd = os.open(
-            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-        )
+        dir_fd = walk_dir(directory)
     except OSError:
         return {}
     try:
@@ -315,9 +423,9 @@ def read_json_at(path, limit):
 
 
 def unlink_at(path):
-    directory, name = os.path.split(os.path.abspath(path))
+    directory, name = split_dir(path)
     try:
-        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        dir_fd = walk_dir(directory)
     except OSError:
         return
     try:
@@ -580,7 +688,7 @@ def oauth_login(client_id, client_secret):
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
     try:
-        launch([trusted_binary("xdg-open"), url])
+        launch([trusted_executable("xdg-open"), url])
     except RuntimeError as error:
         # No xdg-open, or it would not start. The URL is already printed
         # above, which is the whole of what opening it would have done.
@@ -998,22 +1106,68 @@ ENV_PASSTHROUGH = (
 )
 
 
-def trusted_binary(name):
-    """Resolve a name we chose ourselves to an absolute path we trust."""
+class Executable:
+    """A program identified by descriptor rather than by name.
+
+    `path` is kept only so the child gets a sensible argv[0] and failures
+    can be reported with a name a person recognises. It is never resolved
+    again: `fd` is what gets executed.
+    """
+
+    def __init__(self, path, fd):
+        self.path = path
+        self.fd = fd
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def trusted_executable(name):
+    """Resolve a name OmaTube chose itself to a descriptor it has verified.
+
+    stat() on a pathname followed by Popen() of the same pathname is two
+    lookups with a gap in between, and the gap is the whole problem: what was
+    checked need not be what runs. So each candidate directory is walked
+    component by component with O_NOFOLLOW, every component required to be
+    root-owned and unwritable by anyone else, and the candidate is then
+    opened O_PATH|O_NOFOLLOW relative to that descriptor.
+
+    Everything is decided on that descriptor — regular file, owned by root,
+    not writable by group or other, executable — and the same descriptor is
+    what launch() hands to exec. Nothing is ever resolved by name twice.
+    """
     for directory in TRUSTED_BIN_DIRS:
-        candidate = os.path.join(directory, name)
         try:
-            info = os.stat(candidate)
+            dir_fd = walk_dir(directory, require_uid=0)
         except OSError:
+            # A candidate directory that is a link, missing, or writable by
+            # someone else is simply not a place we look.
             continue
-        if not stat.S_ISREG(info.st_mode):
-            continue
-        # A system binary anyone can rewrite is not one we should be
-        # reaching for on our own initiative.
-        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            continue
-        if os.access(candidate, os.X_OK):
-            return candidate
+        try:
+            try:
+                fd = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except OSError:
+                continue
+        finally:
+            os.close(dir_fd)
+
+        info = os.fstat(fd)
+        approved = (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == 0
+            and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        )
+        if approved:
+            return Executable(os.path.join(directory, name), fd)
+        os.close(fd)
+
     raise RuntimeError("%s is not installed" % name)
 
 
@@ -1039,14 +1193,13 @@ def child_env():
     return env
 
 
-def player_error(binary, code, output):
+def player_error(name, code, output):
     """Pull the one useful line out of a player's death rattle.
 
     mpv reports a failed yt-dlp resolution as a wall of hook output; the bar
     has room for a sentence. Prefer the first line that names an error, and
     strip the "[ytdl_hook] " style prefix that only says where it came from.
     """
-    name = os.path.basename(binary)
     for line in (output or "").splitlines():
         line = line.strip()
         if not line:
@@ -1061,6 +1214,11 @@ def player_error(binary, code, output):
 def launch(command, probe=0.0):
     """Start the player detached, but notice if it dies on the spot.
 
+    command[0] is either an Executable — a descriptor trusted_executable()
+    already verified, which is executed through /proc/self/fd so the thing
+    that runs is the thing that was checked — or an absolute path, which is
+    only ever a playerCommand the user wrote and named themselves.
+
     The player has to outlive this process and the shell, so it goes into its
     own session. That used to mean its output went to /dev/null and a failure
     — a missing codec, a yt-dlp that cannot resolve the video — was silent:
@@ -1074,31 +1232,50 @@ def launch(command, probe=0.0):
     watchdog terminates: a deadline on this process is a deadline on this
     process, not on the film you just started.
     """
-    binary = command[0]
-    if not os.path.isabs(binary):
+    head = command[0]
+    if isinstance(head, Executable):
+        # argv[0] stays the name the program expects to see; what is actually
+        # executed is the descriptor, by way of the one path that resolves to
+        # an already-open file rather than to a fresh lookup.
+        argv = [head.path] + list(command[1:])
+        executable = "/proc/self/fd/%d" % head.fd
+        keep = (head.fd,)
+        name = head.name
+    elif os.path.isabs(head):
+        argv = list(command)
+        executable = head
+        keep = ()
+        name = os.path.basename(head)
+    else:
         # Every caller resolves first. This is the backstop that makes that
         # a property of the program rather than a habit of its callers.
-        raise RuntimeError("refusing to run %s: not an absolute path" % binary)
+        raise RuntimeError("refusing to run %s: not an absolute path" % head)
 
     # Without a probe window nothing ever reads the output, so there is no
     # reason to hand the player a file to write it to.
     log = state().open_log(PLAYER_LOG_NAME) if probe > 0 else None
     try:
         process = subprocess.Popen(
-            command,
+            argv,
+            executable=executable,
             stdin=subprocess.DEVNULL,
             # mpv reports errors on stdout, not stderr, so both are kept.
             stdout=log if log else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             env=child_env(),
-            close_fds=True,
+            # Popen returns once the child has exec'd, so the descriptor has
+            # done its job by then; the child keeps its own copy for a
+            # script's interpreter to reopen.
+            pass_fds=keep,
             start_new_session=True,
         )
     except OSError as error:
         if log:
             log.close()
-        raise RuntimeError("could not start %s: %s"
-                           % (os.path.basename(binary), error))
+        raise RuntimeError("could not start %s: %s" % (name, error))
+    finally:
+        if isinstance(head, Executable):
+            head.close()
 
     if not log:
         return
@@ -1117,7 +1294,7 @@ def launch(command, probe=0.0):
         log.seek(0)
         output = log.read(MAX_PLAYER_LOG_BYTES)
         log.close()
-        raise RuntimeError(player_error(binary, code, output))
+        raise RuntimeError(player_error(name, code, output))
     log.close()
 
 
@@ -1134,7 +1311,7 @@ def cmd_play(args):
         die("need a video id or --playlist")
 
     if player == "browser":
-        launch([trusted_binary("xdg-open"), url], probe=args.probe)
+        launch([trusted_executable("xdg-open"), url], probe=args.probe)
         return
 
     if player == "custom":
@@ -1164,7 +1341,7 @@ def cmd_play(args):
     #
     # --msg-level keeps mpv's per-frame status line out of the log launch()
     # is holding open, while leaving real errors in it to be reported.
-    command = [trusted_binary("mpv"),
+    command = [trusted_executable("mpv"),
                "--msg-level=all=error", "--force-window=immediate"]
 
     # An mpv.conf carrying `ytdl-raw-options=cookies-from-browser=...` makes
@@ -1187,7 +1364,7 @@ def cmd_play(args):
 
 def cmd_open(args):
     url = LIST_URL + args.playlist if args.playlist else WATCH_URL + args.video_id
-    launch([trusted_binary("xdg-open"), url])
+    launch([trusted_executable("xdg-open"), url])
 
 
 # ---- entry point -----------------------------------------------------------
