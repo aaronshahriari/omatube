@@ -214,6 +214,31 @@ test('itemsArgs only adds flags it was given', () => {
   )
 })
 
+// --- run bounds ----------------------------------------------------------
+
+test('every command gets a deadline, and a sign-in gets the long one', () => {
+  assert.equal(Model.deadlineSeconds(['login', '--client-file', '/x']), 420)
+  assert.equal(Model.deadlineSeconds(['sync']), 90)
+  assert.equal(Model.deadlineSeconds(['items', 'PL1']), 90)
+  assert.equal(Model.deadlineSeconds(['play', 'vid1']), 45)
+  assert.equal(Model.deadlineSeconds(['open', 'vid1']), 45)
+  assert.equal(Model.deadlineSeconds(['remove', 'item1']), 30)
+  // Nothing runs without one, whatever it was asked to do.
+  for (const args of [[], null, undefined, ['nonsense']])
+    assert.ok(Model.deadlineSeconds(args) > 0)
+})
+
+test('the passed-through environment names a session, never a program', () => {
+  const names = Model.envPassthrough()
+  assert.ok(names.includes('WAYLAND_DISPLAY') && names.includes('HOME'))
+  // PATH is built by the CLI, and BROWSER would let the environment pick
+  // the program xdg-open runs.
+  for (const name of ['PATH', 'BROWSER', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+                      'PYTHONPATH', 'PYTHONSTARTUP', 'SHELL', 'IFS'])
+    assert.equal(names.includes(name), false, name + ' must not be passed through')
+  assert.equal(new Set(names).size, names.length)
+})
+
 // --- removal undo --------------------------------------------------------
 
 function held(key, deadline, title) {

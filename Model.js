@@ -227,6 +227,35 @@ function itemsArgs(playlistId, maxAge, limit) {
   return args
 }
 
+// ---- run bounds -----------------------------------------------------------
+
+// Every CLI run gets a deadline, and they differ by more than an order of
+// magnitude: a removal is one HTTP DELETE, a sign-in waits on a person
+// finding their browser and reading a consent screen.
+function deadlineSeconds(args) {
+  var command = args && args.length ? String(args[0]) : ""
+  if (command === "login") return 420
+  if (command === "sync" || command === "items") return 90
+  if (command === "play" || command === "open") return 45
+  return 30
+}
+
+// What the CLI, and the player it starts, are allowed to see of the shell's
+// environment. A desktop session, the user's own defaults, and nothing else
+// — no PATH (the CLI builds its own), and nothing that could name a program
+// for it to run.
+function envPassthrough() {
+  return [
+    "HOME", "USER", "LOGNAME",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ",
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+    "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS",
+    "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "DBUS_SESSION_BUS_ADDRESS"
+  ]
+}
+
 // ---- removal undo ---------------------------------------------------------
 
 // A removal is held for a few seconds before it is sent, so the row can
@@ -315,6 +344,8 @@ if (typeof module !== "undefined" && module.exports) {
     removeArgs: removeArgs,
     openArgs: openArgs,
     itemsArgs: itemsArgs,
+    deadlineSeconds: deadlineSeconds,
+    envPassthrough: envPassthrough,
     pendingKey: pendingKey,
     undoSecondsLeft: undoSecondsLeft,
     expirePending: expirePending,

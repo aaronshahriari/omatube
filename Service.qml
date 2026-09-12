@@ -33,6 +33,20 @@ Item {
   readonly property string cli: pluginDir + "bin/omatube"
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/omatube"
 
+  // The CLI runs with this instead of whatever the shell happens to have
+  // inherited. Built once: the names come from Model so they can be read
+  // and tested in one place.
+  readonly property var cliEnvironment: {
+    var env = ({})
+    var names = Model.envPassthrough()
+    for (var i = 0; i < names.length; i++) {
+      var value = Quickshell.env(names[i])
+      if (value !== undefined && value !== null && value !== "")
+        env[names[i]] = String(value)
+    }
+    return env
+  }
+
   readonly property string player: setting("player", "mpv")
   readonly property string playerCommand: setting("playerCommand", "")
   readonly property bool skipCookies: setting("skipCookies", true) !== false
@@ -72,7 +86,7 @@ Item {
 
   readonly property int refreshIntervalSec: Model.syncIntervalSeconds(setting("syncInterval", "30 minutes"))
   readonly property bool autoSyncs: refreshIntervalSec > 0
-  readonly property bool syncing: syncProc.running
+  readonly property bool syncing: syncProc.busy
   property string actionError: ""
 
   // `force` is an explicit user action — opening a panel, the refresh
@@ -80,25 +94,20 @@ Item {
   // process just completed is not repeated.
   function refresh(force) {
     nowDate = new Date()
-    if (syncProc.running) return
-    syncProc.command = force === false
-      ? [root.cli, "sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
-      : [root.cli, "sync"]
-    syncProc.running = true
+    if (syncProc.busy) return
+    var args = force === false
+      ? ["sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
+      : ["sync"]
+    syncProc.start(args, Model.deadlineSeconds(args))
   }
 
-  Process {
+  SupervisedProcess {
     id: syncProc
-    command: [root.cli, "sync"]
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var raw = String(text || "").trim()
-        if (raw !== "") root.actionError = Model.elide(raw, 120)
-      }
-    }
+    cli: root.cli
+    environment: root.cliEnvironment
     onExited: function(code) {
       if (code === 0) root.actionError = ""
+      else if (errorText !== "") root.actionError = Model.elide(errorText, 120)
       root.nowDate = new Date()
     }
   }
@@ -131,7 +140,7 @@ Item {
 
   function loadItems(playlistId, force) {
     if (!playlistId) return
-    if (itemsProc.running) {
+    if (itemsProc.busy) {
       queuedPlaylist = playlistId
       return
     }
@@ -139,23 +148,18 @@ Item {
     // only a first open shows a spinner.
     loadingPlaylist = Model.hasItems(cache, playlistId) ? "" : playlistId
     var args = Model.itemsArgs(playlistId, force === true ? 0 : 120, 0)
-    itemsProc.command = [root.cli].concat(args)
-    itemsProc.running = true
+    itemsProc.start(args, Model.deadlineSeconds(args))
   }
 
   property string queuedPlaylist: ""
 
-  Process {
+  SupervisedProcess {
     id: itemsProc
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var raw = String(text || "").trim()
-        if (raw !== "") root.actionError = Model.elide(raw, 120)
-      }
-    }
+    cli: root.cli
+    environment: root.cliEnvironment
     onExited: function(code) {
       if (code === 0) root.actionError = ""
+      else if (errorText !== "") root.actionError = Model.elide(errorText, 120)
       root.loadingPlaylist = ""
       // Clicking through playlists faster than they load must not drop the
       // one that is actually on screen now.
@@ -171,17 +175,13 @@ Item {
 
   property var actionQueue: []
 
-  Process {
+  SupervisedProcess {
     id: actionProc
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var raw = String(text || "").trim()
-        if (raw !== "") root.actionError = Model.elide(raw, 120)
-      }
-    }
+    cli: root.cli
+    environment: root.cliEnvironment
     onExited: function(code) {
       if (code === 0) root.actionError = ""
+      else if (errorText !== "") root.actionError = Model.elide(errorText, 120)
       root.connecting = false
       root.drainQueue()
     }
@@ -189,12 +189,11 @@ Item {
 
   function runAction(args) {
     if (!args) return
-    if (actionProc.running) {
+    if (actionProc.busy) {
       actionQueue = actionQueue.concat([args])
       return
     }
-    actionProc.command = [root.cli].concat(args)
-    actionProc.running = true
+    actionProc.start(args, Model.deadlineSeconds(args))
   }
 
   function drainQueue() {
@@ -202,8 +201,7 @@ Item {
     var queued = actionQueue.slice()
     var next = queued.shift()
     actionQueue = queued
-    actionProc.command = [root.cli].concat(next)
-    actionProc.running = true
+    actionProc.start(next, Model.deadlineSeconds(next))
   }
 
   // ---- playing -----------------------------------------------------------
@@ -217,28 +215,22 @@ Item {
   // anything older has been superseded rather than stacked up.
   property var playPending: null
 
-  readonly property bool playing: playProc.running
+  readonly property bool playing: playProc.busy
 
-  Process {
+  SupervisedProcess {
     id: playProc
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var raw = String(text || "").trim()
-        if (raw !== "") root.playError = Model.elide(raw, 160)
-      }
-    }
+    cli: root.cli
+    environment: root.cliEnvironment
     onExited: function(code) {
       if (code === 0) root.playError = ""
+      else if (errorText !== "") root.playError = Model.elide(errorText, 160)
       if (root.playPending) {
         var next = root.playPending
         root.playPending = null
         // A cancelled probe reports a signal, not a failure of the player it
         // was watching; do not leave its exit dressed up as an error.
         root.playError = ""
-        playProc.command = [root.cli].concat(next)
-        playProc.running = true
+        playProc.start(next, Model.deadlineSeconds(next))
       }
     }
   }
@@ -256,13 +248,12 @@ Item {
     // is in its own session and plays on. What is lost is the error report
     // for the first one, which stopped mattering the moment something else
     // was asked for.
-    if (playProc.running) {
+    if (playProc.busy) {
       playPending = args
-      playProc.running = false
+      playProc.stop()
       return
     }
-    playProc.command = [root.cli].concat(args)
-    playProc.running = true
+    playProc.start(args, Model.deadlineSeconds(args))
   }
 
   function play(video) {

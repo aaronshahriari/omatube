@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """YouTube playlist client for the OmaTube Omarchy shell plugin.
 
 The shell never talks to YouTube. This CLI owns the OAuth credentials and
@@ -21,6 +21,10 @@ Commands:
 Everything reads and writes two files:
   ~/.local/state/omarchy/omatube/token.json   credentials, mode 0600
   ~/.local/state/omarchy/omatube/data.json    the cache the shell renders
+
+Both go through a directory held open by descriptor, every response off the
+network is read against a ceiling, and a run can be given a deadline it
+cannot outlive. See "hard limits" and SafeDir below.
 """
 
 import argparse
@@ -33,6 +37,8 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -40,11 +46,19 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import webbrowser
 
 API = "https://www.googleapis.com/youtube/v3"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+# The only three hosts this program is allowed to open a socket to. Checked
+# on the request and again on every redirect, so a 302 cannot walk the
+# bearer token somewhere else.
+ALLOWED_HOSTS = frozenset({
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+})
 
 # playlistItems.delete is the reason this is the full manage scope rather
 # than youtube.readonly. Removing a video is half the point of the plugin.
@@ -59,14 +73,43 @@ CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")),
     "omarchy", "omatube",
 )
-TOKEN_PATH = os.path.join(STATE_DIR, "token.json")
-DATA_PATH = os.path.join(STATE_DIR, "data.json")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+TOKEN_NAME = "token.json"
+DATA_NAME = "data.json"
+CONFIG_NAME = "config.json"
+PLAYER_LOG_NAME = "player.log"
+TOKEN_PATH = os.path.join(STATE_DIR, TOKEN_NAME)
+DATA_PATH = os.path.join(STATE_DIR, DATA_NAME)
+CONFIG_PATH = os.path.join(CONFIG_DIR, CONFIG_NAME)
 
 WATCH_URL = "https://www.youtube.com/watch?v="
 LIST_URL = "https://www.youtube.com/playlist?list="
 
 USER_AGENT = "omatube/0.1 (+https://github.com/aaronshahriari/omatube)"
+
+
+# ---- hard limits -----------------------------------------------------------
+#
+# This process is short-lived but the shell that starts it is not, and a
+# long-lived parent is exactly what an unbounded read costs you. Nothing
+# below grows with what a server decides to send: every socket read, every
+# page walk, and every file read has a ceiling it is checked against, and
+# exceeding one is an error rather than a bigger buffer.
+
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024     # one API page, generously
+MAX_TOKEN_BYTES = 64 * 1024              # an OAuth token response is ~1 KB
+MAX_ERROR_BYTES = 16 * 1024              # so is Google's error envelope
+MAX_REDIRECTS = 3
+
+MAX_PAGES = 40                           # 50 items a page
+MAX_ITEMS = 2000                         # and never more than this in total
+HTTP_TIMEOUT = 20                        # seconds, one request
+PAGED_BUDGET = 120                       # seconds, a whole pageToken walk
+
+MAX_JSON_FILE_BYTES = 16 * 1024 * 1024   # our own cache, if something grew it
+MAX_CLIENT_FILE_BYTES = 64 * 1024        # a pasted OAuth client blob
+MAX_PLAYER_LOG_BYTES = 256 * 1024        # how much of a player's noise we read
+
+KILL_GRACE = 3.0                         # TERM, then this long, then KILL
 
 
 # ---- small io helpers ------------------------------------------------------
@@ -77,27 +120,212 @@ def die(message, code=1):
     sys.exit(code)
 
 
-def write_json(path, payload, mode=0o644):
-    """Write atomically.
+class SafeDir:
+    """A directory kept open by descriptor, for state we cannot afford to
+    have redirected underneath us.
 
-    The shell watches data.json with a FileView and reloads on change. A
-    partial write there is a parse error in the bar, so the file is only
-    ever swapped in complete.
+    Every read, write, rename and unlink below names a file *relative to this
+    fd*, so the directory is resolved exactly once, at open time, and cannot
+    be swapped for a symlink between the check and the use. Files are opened
+    O_NOFOLLOW and their ownership and type confirmed on the descriptor we
+    actually hold, not on a path we hope still means the same thing.
+
+    This does not pretend to defend the token from a process already running
+    as you — that process can read the file outright, and a UID boundary is
+    the only one there is. What it does remove is the class of bug where a
+    link, a swapped directory, or a predictable temporary name turns a write
+    we intended for ~/.local/state into a write somewhere else.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+
+    def __init__(self, path, create=True, mode=0o700):
+        self.path = path
+        if create:
+            os.makedirs(path, mode=mode, exist_ok=True)
+        self.fd = os.open(
+            path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        info = os.fstat(self.fd)
+        if info.st_uid != os.getuid():
+            die("%s is not owned by you — refusing to use it" % path)
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            # Tighten rather than refuse: this is our own directory, and the
+            # only thing that can be done about a loose mode is to fix it.
+            os.fchmod(self.fd, mode)
+
+    def read_bytes(self, name, limit, private=False):
+        """Contents of one file, or None if it is absent, too big, or not
+        the plain file we own that it is supposed to be."""
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.fd
+            )
+        except OSError:
+            return None
+        # Everything is decided on the descriptor we are holding, before it
+        # is wrapped: a directory, a fifo or a device where a state file
+        # should be is a refusal, not something to try to read.
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            if info.st_uid != os.getuid():
+                print("%s/%s is not owned by you — ignoring it"
+                      % (self.path, name), file=sys.stderr)
+                return None
+            if private and info.st_mode & 0o077:
+                # Something loosened the mode on a credential file. Close it
+                # back down through the descriptor we are already holding,
+                # which is the one race-free way to do it, and say so.
+                os.fchmod(handle.fileno(), 0o600)
+                print("%s/%s was readable by others; mode reset to 0600"
+                      % (self.path, name), file=sys.stderr)
+            if info.st_size > limit:
+                print("%s/%s is larger than %d bytes — ignoring it"
+                      % (self.path, name, limit), file=sys.stderr)
+                return None
+            raw = handle.read(limit + 1)
+        return None if len(raw) > limit else raw
+
+    def read_json(self, name, limit=MAX_JSON_FILE_BYTES, private=False):
+        raw = self.read_bytes(name, limit, private=private)
+        if raw is None:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return {}
+
+    def write_json(self, name, payload, mode=0o644):
+        """Write atomically, through a temporary name nobody can guess.
+
+        The shell watches data.json with a FileView and reloads on change. A
+        partial write there is a parse error in the bar, so the file is only
+        ever swapped in complete.
+
+        The temporary is created O_EXCL under a random name, which means it
+        is ours or the write fails — never an existing file, never a link
+        pointing somewhere else, and never a name another process could have
+        staked out in advance.
+        """
+        blob = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        tmp = ".%s.%s.tmp" % (name, secrets.token_hex(8))
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            mode,
+            dir_fd=self.fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(blob)
+                handle.flush()
+                # Explicit: the open mode is masked by umask, this is not.
+                os.fchmod(handle.fileno(), mode)
+                os.fsync(handle.fileno())
+            os.replace(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+        try:
+            os.fsync(self.fd)
+        except OSError:
+            pass
+
+    def unlink(self, name):
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except OSError:
+            pass
+
+    def open_log(self, name, limit_mode=0o600):
+        """A truncated-per-launch log, opened without following a link."""
+        fd = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+            limit_mode,
+            dir_fd=self.fd,
+        )
+        return os.fdopen(fd, "w+", encoding="utf-8", errors="replace")
 
 
-def read_json(path, fallback=None):
+_state_dir = None
+_config_dir = False
+
+
+def state():
+    """The state directory, created on first use and then held open."""
+    global _state_dir
+    if _state_dir is None:
+        _state_dir = SafeDir(STATE_DIR)
+    return _state_dir
+
+
+def config_dir():
+    """The config directory if the user made one; never created by us."""
+    global _config_dir
+    if _config_dir is False:
+        try:
+            _config_dir = SafeDir(CONFIG_DIR, create=False)
+        except OSError:
+            _config_dir = None
+    return _config_dir
+
+
+def read_json_at(path, limit):
+    """Read a JSON file the user named, by descriptor.
+
+    Used for --client-file, which can point anywhere, so the parent directory
+    is opened first and the file named relative to it. A symlink at either
+    end is a refusal, not something to follow and find out about later.
+    """
+    directory, name = os.path.split(os.path.abspath(path))
     try:
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
-        return {} if fallback is None else fallback
+        dir_fd = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+    except OSError:
+        return {}
+    try:
+        try:
+            fd = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+            )
+        except OSError:
+            return {}
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            os.close(fd)
+            return {}
+        with os.fdopen(fd, "rb") as handle:
+            if info.st_size > limit:
+                return {}
+            raw = handle.read(limit + 1)
+        if len(raw) > limit:
+            return {}
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return {}
+    finally:
+        os.close(dir_fd)
+
+
+def unlink_at(path):
+    directory, name = os.path.split(os.path.abspath(path))
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def load_config():
@@ -106,7 +334,8 @@ def load_config():
     Inside the shell the plugin's settings live inline in shell.json and
     arrive as flags, so this only matters when you run the CLI yourself.
     """
-    config = read_json(CONFIG_PATH)
+    directory = config_dir()
+    config = directory.read_json(CONFIG_NAME) if directory else {}
     return {
         "player": config.get("player", "mpv"),
         "playerCommand": config.get("playerCommand", ""),
@@ -120,11 +349,11 @@ def load_config():
 
 
 def load_token():
-    return read_json(TOKEN_PATH)
+    return state().read_json(TOKEN_NAME, private=True)
 
 
 def save_token(token):
-    write_json(TOKEN_PATH, token, mode=0o600)
+    state().write_json(TOKEN_NAME, token, mode=0o600)
 
 
 class AuthRequired(Exception):
@@ -149,9 +378,10 @@ def access_token():
     }).encode()
 
     try:
-        fresh = http_json(TOKEN_URL, data=payload, method="POST")
+        fresh = http_json(TOKEN_URL, data=payload, method="POST",
+                          limit=MAX_TOKEN_BYTES)
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", "replace")
+        body = read_capped_text(error, MAX_ERROR_BYTES)
         # invalid_grant means the refresh token is dead: revoked, expired
         # after inactivity, or the OAuth client was deleted. Nothing here
         # can recover it, so drop it and ask for a fresh sign-in.
@@ -168,15 +398,77 @@ def access_token():
 # ---- http ------------------------------------------------------------------
 
 
-def http_json(url, data=None, method="GET", headers=None, timeout=20):
+def check_url(url):
+    """Refuse anything outside the three hosts this program talks to."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS:
+        raise RuntimeError("refusing to contact %s" % (parts.netloc or url))
+    return url
+
+
+class StrictRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to a host on the list, and drop the bearer
+    token if the host changes at all."""
+
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_url(newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        was = urllib.parse.urlsplit(req.full_url).hostname
+        now = urllib.parse.urlsplit(newurl).hostname
+        if was != now:
+            new.remove_header("Authorization")
+        return new
+
+
+OPENER = urllib.request.build_opener(StrictRedirect)
+
+
+def read_capped(stream, limit, what="response"):
+    """Read a body with a ceiling, and treat the ceiling as an error.
+
+    Reading one byte past the limit is what tells us it was exceeded;
+    stopping at exactly the limit would silently truncate instead. Both the
+    declared length and the actual bytes are checked, because a server is
+    free to lie about the first one.
+    """
+    declared = None
+    headers = getattr(stream, "headers", None)
+    if headers is not None:
+        raw_length = headers.get("Content-Length")
+        if raw_length and raw_length.strip().isdigit():
+            declared = int(raw_length.strip())
+    if declared is not None and declared > limit:
+        raise RuntimeError("%s declared %d bytes, over the %d byte limit"
+                           % (what, declared, limit))
+    body = stream.read(limit + 1)
+    if len(body) > limit:
+        raise RuntimeError("%s exceeded the %d byte limit" % (what, limit))
+    return body
+
+
+def read_capped_text(stream, limit, what="error body"):
+    """The same, for a body that is only ever shown to a human."""
+    try:
+        return read_capped(stream, limit, what).decode("utf-8", "replace")
+    except RuntimeError as error:
+        return str(error)
+
+
+def http_json(url, data=None, method="GET", headers=None,
+              timeout=HTTP_TIMEOUT, limit=MAX_RESPONSE_BYTES):
+    check_url(url)
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("User-Agent", USER_AGENT)
     if data is not None:
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
     for key, value in (headers or {}).items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read()
+    with OPENER.open(request, timeout=timeout) as response:
+        raw = read_capped(response, limit)
     return json.loads(raw) if raw else {}
 
 
@@ -189,7 +481,7 @@ def api(path, params=None, method="GET"):
     try:
         return http_json(url, method=method, headers=headers)
     except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", "replace")
+        body = read_capped_text(error, MAX_ERROR_BYTES)
         raise RuntimeError(api_error_message(error.code, body)) from None
 
 
@@ -288,9 +580,11 @@ def oauth_login(client_id, client_secret):
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
     try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+        launch([trusted_binary("xdg-open"), url])
+    except RuntimeError as error:
+        # No xdg-open, or it would not start. The URL is already printed
+        # above, which is the whole of what opening it would have done.
+        print("could not open a browser (%s)" % error, file=sys.stderr)
     thread.join(timeout=300)
     server.server_close()
 
@@ -314,7 +608,8 @@ def oauth_login(client_id, client_secret):
     try:
         token = http_json(TOKEN_URL, data=payload, method="POST")
     except urllib.error.HTTPError as error:
-        die("token exchange failed: " + error.read().decode("utf-8", "replace"))
+        die("token exchange failed: "
+            + read_capped_text(error, MAX_ERROR_BYTES))
 
     if not token.get("refresh_token"):
         die("Google returned no refresh token — revoke OmaTube's access at "
@@ -372,17 +667,33 @@ def pick_thumb(thumbnails):
 
 
 def paged(path, params, cap=None):
-    """Walk pageToken until YouTube stops handing them out."""
-    out, token = [], None
-    while True:
+    """Walk pageToken until YouTube stops handing them out, or until one of
+    the ceilings below stops us first.
+
+    A caller that passes no cap used to mean "all of it", which is only a
+    sane instruction as long as the far end is. Three things end the walk
+    besides a missing token: a total item count, a page count, and a wall
+    clock budget — and a pageToken we have already followed, which is how a
+    server keeps you looping forever without ever growing a single response.
+    """
+    limit = min(cap, MAX_ITEMS) if cap else MAX_ITEMS
+    out, token, seen = [], None, set()
+    deadline = time.monotonic() + PAGED_BUDGET
+
+    for _page in range(MAX_PAGES):
         page = dict(params)
         if token:
             page["pageToken"] = token
         response = api(path, page)
-        out.extend(response.get("items", []))
+        out.extend(response.get("items") or [])
+        if len(out) >= limit:
+            break
         token = response.get("nextPageToken")
-        if not token or (cap and len(out) >= cap):
-            return out[:cap] if cap else out
+        if not token or token in seen or time.monotonic() > deadline:
+            break
+        seen.add(token)
+
+    return out[:limit]
 
 
 # ---- cache -----------------------------------------------------------------
@@ -401,14 +712,14 @@ def empty_cache():
 
 
 def load_cache():
-    cache = read_json(DATA_PATH)
+    cache = state().read_json(DATA_NAME)
     base = empty_cache()
     base.update(cache if isinstance(cache, dict) else {})
     return base
 
 
 def save_cache(cache):
-    write_json(DATA_PATH, cache)
+    state().write_json(DATA_NAME, cache)
 
 
 def record_failure(error):
@@ -471,15 +782,14 @@ def cmd_login(args):
         # The shell's FileView saves asynchronously, so the file can still
         # be missing for a moment after the panel asks us to read it.
         deadline = time.time() + 5
-        while not os.path.exists(args.client_file) and time.time() < deadline:
+        pasted = read_json_at(args.client_file, MAX_CLIENT_FILE_BYTES)
+        while not pasted and time.time() < deadline:
             time.sleep(0.05)
+            pasted = read_json_at(args.client_file, MAX_CLIENT_FILE_BYTES)
 
-        pasted = read_json(args.client_file)
-        # The secret is now in the token store; leave no second copy behind.
-        try:
-            os.remove(args.client_file)
-        except OSError:
-            pass
+        # The secret is now on its way to the token store; leave no second
+        # copy behind, whether or not we could read anything out of it.
+        unlink_at(args.client_file)
         if not pasted:
             # Also accept the credentials JSON downloaded from the console
             # verbatim, which nests everything under "installed".
@@ -500,11 +810,8 @@ def cmd_login(args):
 
 
 def cmd_logout(_args):
-    for path in (TOKEN_PATH, DATA_PATH):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    for name in (TOKEN_NAME, DATA_NAME):
+        state().unlink(name)
     save_cache(empty_cache())
     print("signed out", file=sys.stderr)
 
@@ -662,7 +969,74 @@ def cmd_remove(args):
     save_cache(cache)
 
 
-PLAYER_LOG = os.path.join(STATE_DIR, "player.log")
+# ---- launching things ------------------------------------------------------
+#
+# Two different trust levels live here. A custom player command is the user
+# naming a program and is run as named. Everything automatic — the mpv the
+# plugin defaults to, the xdg-open behind "open in browser" — is not a user
+# instruction to run whatever happens to answer to that name first on PATH,
+# so it is resolved against system directories and executed by absolute
+# path. Either way the child gets a built environment rather than ours.
+
+TRUSTED_BIN_DIRS = ("/usr/local/bin", "/usr/bin", "/bin")
+
+SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+# What a player or the browser opener needs to find a display, a sound
+# server, and the user's own defaults — and nothing else. Notably absent is
+# BROWSER, which xdg-open would take as a command to run: the default path
+# picks a program from the user's desktop configuration, not from a variable
+# anything in this process's ancestry could have set.
+ENV_PASSTHROUGH = (
+    "HOME", "USER", "LOGNAME",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ",
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+    "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS",
+    "XDG_CACHE_HOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+)
+
+
+def trusted_binary(name):
+    """Resolve a name we chose ourselves to an absolute path we trust."""
+    for directory in TRUSTED_BIN_DIRS:
+        candidate = os.path.join(directory, name)
+        try:
+            info = os.stat(candidate)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        # A system binary anyone can rewrite is not one we should be
+        # reaching for on our own initiative.
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            continue
+        if os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError("%s is not installed" % name)
+
+
+def user_binary(name):
+    """Resolve the first word of a command the user wrote."""
+    if os.path.isabs(name):
+        if os.access(name, os.X_OK):
+            return name
+        raise RuntimeError("%s is not executable" % name)
+    found = shutil.which(name, path=SAFE_PATH) or shutil.which(name)
+    if not found:
+        raise RuntimeError("%s is not installed" % name)
+    return os.path.abspath(found)
+
+
+def child_env():
+    """A built environment, not an inherited one."""
+    env = {"PATH": SAFE_PATH}
+    for name in ENV_PASSTHROUGH:
+        value = os.environ.get(name)
+        if value is not None and "\0" not in value:
+            env[name] = value
+    return env
 
 
 def player_error(binary, code, output):
@@ -672,6 +1046,7 @@ def player_error(binary, code, output):
     has room for a sentence. Prefer the first line that names an error, and
     strip the "[ytdl_hook] " style prefix that only says where it came from.
     """
+    name = os.path.basename(binary)
     for line in (output or "").splitlines():
         line = line.strip()
         if not line:
@@ -679,8 +1054,8 @@ def player_error(binary, code, output):
         if "ERROR" in line or "error:" in line.lower() or "failed" in line.lower():
             line = re.sub(r"^\[[^\]]+\]\s*", "", line)
             line = re.sub(r"^ERROR:\s*", "", line)
-            return "%s: %s" % (binary, line[:200])
-    return "%s exited with status %d" % (binary, code)
+            return "%s: %s" % (name, line[:200])
+    return "%s exited with status %d" % (name, code)
 
 
 def launch(command, probe=0.0):
@@ -694,34 +1069,42 @@ def launch(command, probe=0.0):
     So output is kept, and for `probe` seconds we watch. A player that is
     still alive at the end of the window is working and is left alone; one
     that has already exited non-zero gets its output read back and reported.
+
+    Its own session is also what keeps it out of the process group the
+    watchdog terminates: a deadline on this process is a deadline on this
+    process, not on the film you just started.
     """
     binary = command[0]
-    if not shutil.which(binary):
-        raise RuntimeError("%s is not installed" % binary)
+    if not os.path.isabs(binary):
+        # Every caller resolves first. This is the backstop that makes that
+        # a property of the program rather than a habit of its callers.
+        raise RuntimeError("refusing to run %s: not an absolute path" % binary)
 
-    os.makedirs(STATE_DIR, exist_ok=True)
-    # Truncated per launch, and the mpv path runs at --msg-level=all=error,
-    # so a long film does not quietly write a status line to disk all night.
-    log = open(PLAYER_LOG, "w+", encoding="utf-8", errors="replace")
+    # Without a probe window nothing ever reads the output, so there is no
+    # reason to hand the player a file to write it to.
+    log = state().open_log(PLAYER_LOG_NAME) if probe > 0 else None
     try:
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             # mpv reports errors on stdout, not stderr, so both are kept.
-            stdout=log,
+            stdout=log if log else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
+            env=child_env(),
+            close_fds=True,
             start_new_session=True,
         )
     except OSError as error:
-        log.close()
-        raise RuntimeError("could not start %s: %s" % (binary, error))
+        if log:
+            log.close()
+        raise RuntimeError("could not start %s: %s"
+                           % (os.path.basename(binary), error))
 
-    if probe <= 0:
-        log.close()
+    if not log:
         return
 
-    deadline = time.time() + probe
-    while time.time() < deadline:
+    deadline = time.monotonic() + probe
+    while time.monotonic() < deadline:
         code = process.poll()
         if code is None:
             time.sleep(0.1)
@@ -732,7 +1115,7 @@ def launch(command, probe=0.0):
             break
         log.flush()
         log.seek(0)
-        output = log.read()
+        output = log.read(MAX_PLAYER_LOG_BYTES)
         log.close()
         raise RuntimeError(player_error(binary, code, output))
     log.close()
@@ -751,13 +1134,15 @@ def cmd_play(args):
         die("need a video id or --playlist")
 
     if player == "browser":
-        launch(["xdg-open", url], probe=args.probe)
+        launch([trusted_binary("xdg-open"), url], probe=args.probe)
         return
 
     if player == "custom":
         if not custom.strip():
             die("player is 'custom' but no command is configured")
         parts = shlex.split(custom)
+        if not parts:
+            die("player is 'custom' but no command is configured")
         # {url}/{id} anywhere in the command, else the URL is appended —
         # which is what almost every video player expects anyway.
         if any("{url}" in part or "{id}" in part for part in parts):
@@ -767,6 +1152,7 @@ def cmd_play(args):
             ]
         else:
             parts.append(url)
+        parts[0] = user_binary(parts[0])
         launch(parts, probe=args.probe)
         return
 
@@ -778,7 +1164,8 @@ def cmd_play(args):
     #
     # --msg-level keeps mpv's per-frame status line out of the log launch()
     # is holding open, while leaving real errors in it to be reported.
-    command = ["mpv", "--msg-level=all=error", "--force-window=immediate"]
+    command = [trusted_binary("mpv"),
+               "--msg-level=all=error", "--force-window=immediate"]
 
     # An mpv.conf carrying `ytdl-raw-options=cookies-from-browser=...` makes
     # yt-dlp re-read and decrypt the browser's cookie database on every
@@ -799,14 +1186,83 @@ def cmd_play(args):
 
 
 def cmd_open(args):
-    launch(["xdg-open", LIST_URL + args.playlist if args.playlist else WATCH_URL + args.video_id])
+    url = LIST_URL + args.playlist if args.playlist else WATCH_URL + args.video_id
+    launch([trusted_binary("xdg-open"), url])
 
 
 # ---- entry point -----------------------------------------------------------
 
 
+_watchdog_firing = False
+
+
+def _on_term(_signum, _frame):
+    """A TERM from outside ends the run; our own group TERM does not.
+
+    The shell stops a run by terminating it, and that should stop it
+    promptly. The watchdog below also terminates the group, and in that one
+    case we have to outlive the signal long enough to escalate to KILL.
+    """
+    if _watchdog_firing:
+        return
+    os._exit(143)
+
+
+def start_watchdog(seconds):
+    """Put a ceiling on this whole run, and on everything still in its group.
+
+    The shell supervises us from the outside too, but a CLI wedged on a
+    socket the kernel never gives up on is the shell's problem only after it
+    is already ours. setsid makes this process a group leader, so one
+    killpg reaches anything it started; the player is deliberately outside
+    that group, in a session of its own, and plays on.
+
+    The sequence is the ordinary one: TERM, a few seconds to go quietly,
+    then KILL. Anything still in the group has been reaped by the time the
+    process table forgets us.
+    """
+    if seconds <= 0:
+        return
+    try:
+        os.setsid()
+    except OSError:
+        # Already a process group leader — an interactive shell with job
+        # control. The deadline still applies; only the reach changes.
+        pass
+
+    signal.signal(signal.SIGTERM, _on_term)
+
+    def fire():
+        global _watchdog_firing
+        time.sleep(seconds)
+        message = "timed out after %ds" % seconds
+        print("omatube: " + message, file=sys.stderr)
+        try:
+            record_failure(RuntimeError(message))
+        except Exception:
+            pass
+
+        _watchdog_firing = True
+        group = os.getpgrp()
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except OSError:
+            pass
+        time.sleep(KILL_GRACE)
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError:
+            pass
+        os._exit(124)
+
+    threading.Thread(target=fire, daemon=True).start()
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="omatube", description=__doc__.split("\n")[0])
+    parser.add_argument("--deadline", type=float, default=0.0, metavar="SECONDS",
+                        help="terminate this run, and its process group, "
+                             "after SECONDS (0 disables)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("setup", help="how to create the OAuth client").set_defaults(run=cmd_setup)
@@ -863,7 +1319,8 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    os.makedirs(STATE_DIR, exist_ok=True)
+    state()
+    start_watchdog(args.deadline)
     try:
         args.run(args)
     except AuthRequired as error:

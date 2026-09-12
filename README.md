@@ -116,6 +116,8 @@ Videos are fetched when you open a playlist, not on every sync, so forty playlis
 The plugin shells out to `bin/omatube` for everything; it works standalone too.
 
 ```
+omatube [--deadline SECONDS] <command>
+
 omatube setup                    what to create in Google Cloud, and why
 omatube login --client-id ... --client-secret ...
 omatube logout
@@ -129,6 +131,8 @@ omatube play --playlist <id>     play the whole playlist
 omatube open <videoId>           open the watch page in the browser
 omatube remove <playlistItemId>  delete a video from its playlist
 ```
+
+`--deadline` puts a ceiling on the run: at the deadline the process, and the process group it made for itself, get a `TERM`, then a `KILL` three seconds later. The player is started in a session of its own and is deliberately outside that group, so a deadline on the run is never a deadline on what you are watching. The shell passes one on every invocation — 30s for a removal, 90s for a sync, 420s for a sign-in that is waiting on a consent screen.
 
 Standalone player settings live in `~/.config/omarchy/omatube/config.json`:
 
@@ -154,6 +158,24 @@ Omarchy plugins share the shell process and run unsandboxed with your user permi
 Nothing else is written anywhere. Your `mpv.conf` is read by mpv, never by OmaTube.
 
 **Processes.** `xdg-open`, and your chosen player — `mpv`, or whatever `playerCommand` names. Launched detached, watched for a few seconds so a failure can be reported, then let go. No second Quickshell process is ever started.
+
+The two OmaTube picks for itself, `mpv` and `xdg-open`, are resolved to an absolute path under `/usr/local/bin`, `/usr/bin` or `/bin` and executed there — a default is not an instruction to run whatever answers to that name first on `PATH`. A `playerCommand` is you naming a program, and is run as named. Either way the child gets a built environment rather than an inherited one: a display, a sound server, your XDG directories, and a fixed `PATH`. Nothing that could name a program for something else to run — `BROWSER`, `LD_PRELOAD` and the rest — is passed on.
+
+**Bounds.** The shell is long-lived, which is what makes an unbounded read expensive. Nothing here grows with what a server, a file, or a stuck process decides to do.
+
+| | |
+|---|---|
+| HTTP response | 4 MB, and the declared length is checked before the read |
+| OAuth token response | 64 KB |
+| API error body | 16 KB, whatever the tooltip ends up saying |
+| Hosts | the three above, over HTTPS, on the request and on every redirect |
+| Redirects | 3, and the bearer token is dropped if the host changes |
+| Pagination | 40 pages, 2000 items, 120 seconds — and a `pageToken` is never followed twice |
+| State file read | 16 MB, refused rather than truncated |
+| Run time | the `--deadline` above, enforced by the CLI and again by the shell |
+| stderr held by the shell | 400 characters a run, control characters stripped, read a line at a time rather than collected whole |
+
+**State.** `token.json` and `data.json` are reached through a descriptor on their directory, opened once, rather than by pathname each time. Files are opened `O_NOFOLLOW`, and their type, owner and mode are confirmed on the descriptor actually held. A write goes to a randomly named `O_EXCL` temporary and is `rename`d into place, so it can neither inherit a file that was waiting there nor be pointed out of the directory by a link. This does not pretend to defend the token from something already running as you — that can read the file outright, and the UID is the only boundary there is. It removes the narrower case where a link or a swapped directory turns a write meant for `~/.local/state` into a write somewhere else.
 
 **Account access.** The OAuth scope is `youtube`, which is read and write: write is what makes "remove from playlist" possible. `omatube logout` deletes the local token and cache. Revoking the grant itself is done at Google's end, at [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
 
@@ -194,12 +216,14 @@ rm -rf ~/.local/state/omarchy/omatube ~/.config/omarchy/omatube
 
 ```bash
 node --test tests/*.test.js    # pure logic in Model.js
-python3 -m py_compile bin/omatube
+python3 tests/cli_test.py      # the bounds in bin/omatube
 omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" *.qml
 ```
 
 `Model.js` holds everything that is data in, data out — cache shape, search, the removal undo stack — so the awkward parts are testable without a running shell. QML imports it; the tests `require` it.
+
+`tests/cli_test.py` covers the other half: it plants a symlink where a state file should be and checks it is neither read nor written through, feeds `paged()` a feed that never ends, hands `read_capped()` a `Content-Length` that lies, and starts a run that ignores `TERM` to watch the deadline take the process group without taking the player with it.
 
 After changing plugin code, `omarchy-shell shell rescanPlugins`. If the plugin directory is a symlink to a checkout elsewhere, the file watcher will not see your edits — use `omarchy-restart-shell`.
 
