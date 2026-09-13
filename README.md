@@ -225,11 +225,20 @@ rm -rf ~/.local/state/omarchy/omatube ~/.config/omarchy/omatube
 ```bash
 node --test tests/*.test.js    # pure logic in Model.js
 python3 tests/cli_test.py      # the bounds in bin/omatube
+tests/service_test.sh          # a first-run sign-in, under a real shell
 omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" *.qml
 ```
 
 `Model.js` holds everything that is data in, data out — cache shape, search, the removal undo stack — so the awkward parts are testable without a running shell. QML imports it; the tests `require` it.
+
+`tests/service_test.sh` is the one that needs a shell. It runs `Service.qml`
+under quickshell with `HOME` pointed at an empty directory and a `bin/omatube`
+that only pretends, because the thing most likely to break is the first run:
+the cache file the panel watches does not exist yet, and neither does the
+directory it will appear in, so the watch has nothing to attach to and a
+sign-in that worked goes unnoticed until the bar is restarted. It skips if
+quickshell is not installed.
 
 `tests/cli_test.py` covers the other half: it plants a symlink where a state file should be and another one *above* it, replaces a resolved executable with a different inode and checks the original is still what runs, feeds `paged()` a feed that never ends, hands `read_capped()` a `Content-Length` that lies, and starts a run that ignores `TERM` to watch the deadline take the process group without taking the player with it.
 

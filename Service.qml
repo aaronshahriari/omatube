@@ -76,6 +76,19 @@ Item {
     onLoadFailed: root.cache = Model.parseCache("")
   }
 
+  // A FileView arms its watch when its path is set, and on a first run that
+  // happens before ~/.local/state/omarchy/omatube exists. There is no file
+  // to watch and no directory to watch it in, so the watch comes up empty
+  // and stays empty: the data.json that the first `login` writes lands
+  // unseen, and the panel sits on the sign-in form until the bar restarts.
+  //
+  // So the cache is re-read after every run that could have written it
+  // rather than only when something says so. reload() also re-arms the
+  // watch, which by then has a directory to attach to.
+  function reloadCache() {
+    dataFile.reload()
+  }
+
   SystemClock {
     id: clock
     precision: SystemClock.Minutes
@@ -94,6 +107,9 @@ Item {
   // process just completed is not repeated.
   function refresh(force) {
     nowDate = new Date()
+    // True whether or not the sync below actually runs: what is on disk now
+    // is at least as new as what we last parsed.
+    reloadCache()
     if (syncProc.busy) return
     var args = force === false
       ? ["sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
@@ -108,6 +124,7 @@ Item {
     onExited: function(code) {
       if (code === 0) root.actionError = ""
       else if (errorText !== "") root.actionError = Model.elide(errorText, 120)
+      root.reloadCache()
       root.nowDate = new Date()
     }
   }
@@ -160,6 +177,7 @@ Item {
     onExited: function(code) {
       if (code === 0) root.actionError = ""
       else if (errorText !== "") root.actionError = Model.elide(errorText, 120)
+      root.reloadCache()
       root.loadingPlaylist = ""
       // Clicking through playlists faster than they load must not drop the
       // one that is actually on screen now.
@@ -175,16 +193,28 @@ Item {
 
   property var actionQueue: []
 
+  // What actionProc is running right now, so `connecting` below can be read
+  // off the queue instead of being raised and lowered by hand.
+  property var actionRunning: null
+
   SupervisedProcess {
     id: actionProc
     cli: root.cli
     environment: root.cliEnvironment
     onExited: function(code) {
+      root.actionRunning = null
       if (code === 0) root.actionError = ""
       else if (errorText !== "") root.actionError = Model.elide(errorText, 120)
-      root.connecting = false
+      // login writes the cache for the first time, logout empties it, and a
+      // removal rewrites it. All three are worth a re-read.
+      root.reloadCache()
       root.drainQueue()
     }
+  }
+
+  function startAction(args) {
+    actionRunning = args
+    actionProc.start(args, Model.deadlineSeconds(args))
   }
 
   function runAction(args) {
@@ -193,7 +223,7 @@ Item {
       actionQueue = actionQueue.concat([args])
       return
     }
-    actionProc.start(args, Model.deadlineSeconds(args))
+    startAction(args)
   }
 
   function drainQueue() {
@@ -201,7 +231,7 @@ Item {
     var queued = actionQueue.slice()
     var next = queued.shift()
     actionQueue = queued
-    actionProc.start(next, Model.deadlineSeconds(next))
+    startAction(next)
   }
 
   // ---- playing -----------------------------------------------------------
@@ -337,7 +367,10 @@ Item {
 
   // ---- sign-in -----------------------------------------------------------
 
-  property bool connecting: false
+  // Raising a flag on Connect and lowering it on the next exit meant a
+  // removal finishing first put the button back before the browser had even
+  // opened, and a run that never reported back left it disabled for good.
+  readonly property bool connecting: Model.isLoginPending(actionRunning, actionQueue)
 
   property FileView clientFile: FileView {
     path: root.statePath + "/client-paste.json"
@@ -351,7 +384,6 @@ Item {
     var id = String(clientId || "").trim()
     var secret = String(clientSecret || "").trim()
     if (id === "" || secret === "") return
-    connecting = true
     actionError = ""
     clientFile.setText(JSON.stringify({ client_id: id, client_secret: secret }) + "\n")
     runAction(["login", "--client-file", root.statePath + "/client-paste.json"])

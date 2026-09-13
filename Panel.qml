@@ -363,7 +363,6 @@ Panel {
                 foreground: root.fg
                 enabled: !root.syncing
                 opacity: root.syncing ? 0.5 : 1
-                visible: root.signedIn
                 onClicked: root.refresh(true)
               }
             }
@@ -375,9 +374,11 @@ Panel {
           Text {
             width: parent.width
             visible: text !== ""
-            // While the connect form is up it already explains the state, so
-            // a red "not signed in" above it is the same sentence twice.
-            text: !root.signedIn ? ""
+            // While the connect form is up, the cache's own "not signed in"
+            // is the same sentence twice — but a sign-in that just failed is
+            // the only thing that explains why the form is still there, so
+            // that one is shown and the cached one is not.
+            text: !root.signedIn ? root.actionError
               : (root.playError !== "" ? root.playError
                 : (root.actionError !== "" ? root.actionError : root.cacheError))
             textFormat: Text.PlainText

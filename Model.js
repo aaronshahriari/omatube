@@ -214,6 +214,19 @@ function removeArgs(video) {
   return ["remove", String(video.itemId)]
 }
 
+// Whether a sign-in is running or still waiting its turn in the write
+// queue. The panel derives "Connecting…" from this rather than raising a
+// flag when Connect is pressed and lowering it on the next exit to come
+// along: a removal finishing first would have lowered it early, and a run
+// that never reported back would have left it raised for good.
+function isLoginPending(running, queue) {
+  if (running && running[0] === "login") return true
+  if (!Array.isArray(queue)) return false
+  for (var i = 0; i < queue.length; i++)
+    if (queue[i] && queue[i][0] === "login") return true
+  return false
+}
+
 function openArgs(video) {
   if (!video || !video.videoId) return null
   return ["open", String(video.videoId)]
@@ -342,6 +355,7 @@ if (typeof module !== "undefined" && module.exports) {
     playArgs: playArgs,
     playPlaylistArgs: playPlaylistArgs,
     removeArgs: removeArgs,
+    isLoginPending: isLoginPending,
     openArgs: openArgs,
     itemsArgs: itemsArgs,
     deadlineSeconds: deadlineSeconds,

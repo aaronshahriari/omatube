@@ -205,6 +205,20 @@ test('removeArgs uses the playlistItem id, never the video id', () => {
   assert.deepEqual(Model.removeArgs(video()), ['remove', 'item1'])
 })
 
+test('a sign-in stays "connecting" until its own run is the one that ended', () => {
+  const login = ['login', '--client-file', '/tmp/x.json']
+  const removal = ['remove', 'item1']
+
+  // Queued behind a held removal, it is already connecting.
+  assert.equal(Model.isLoginPending(removal, [login]), true)
+  // The removal ending is not the sign-in ending.
+  assert.equal(Model.isLoginPending(login, []), true)
+  // Only an empty queue with nothing running puts the button back.
+  assert.equal(Model.isLoginPending(null, []), false)
+  assert.equal(Model.isLoginPending(removal, [removal]), false)
+  assert.equal(Model.isLoginPending(null, null), false)
+})
+
 test('itemsArgs only adds flags it was given', () => {
   assert.deepEqual(Model.itemsArgs('PL1', 0, 0), ['items', 'PL1'])
   assert.deepEqual(Model.itemsArgs('PL1', 60, 0), ['items', 'PL1', '--max-age', '60'])

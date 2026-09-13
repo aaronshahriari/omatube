@@ -16,6 +16,11 @@ import Quickshell.Io
 //   reach    the CLI makes itself a process group leader, so the escalation
 //            below reaches everything it started. The player is not in that
 //            group — it is started in a session of its own and plays on.
+//
+// And one thing a run must always do is report back. A command that cannot
+// be started at all is reported by Quickshell as `running` going false with
+// no exited() behind it, which would leave every caller waiting on this run
+// waiting for good; it is turned into an ordinary failed exit below.
 Item {
   id: root
 
@@ -45,6 +50,8 @@ Item {
     _buffer = ""
     _dropped = 0
     _timedOut = false
+    _live = true
+    _exitSeen = false
     errorText = ""
     settle.stop()
     proc.command = [root.cli, "--deadline", String(_seconds)].concat(args)
@@ -65,6 +72,22 @@ Item {
   property int _dropped: 0
   property bool _timedOut: false
   property int _code: 0
+  // A run is live from start() until its exit has been reported; _exitSeen
+  // says whether that exit actually came from the process.
+  property bool _live: false
+  property bool _exitSeen: false
+
+  // The exit a process that never ran would have had. 127 is what a shell
+  // gives a command it could not find, and the callers here only ask
+  // whether the code was zero.
+  function _failedToStart() {
+    _live = false
+    deadline.stop()
+    killer.stop()
+    settle.stop()
+    errorText = "could not run " + root.cli
+    root.exited(127)
+  }
 
   function _collect(data) {
     // Control characters are stripped on the way in: this text is about to
@@ -101,12 +124,21 @@ Item {
 
     onExited: function(code) {
       root._code = code
+      root._exitSeen = true
       deadline.stop()
       killer.stop()
       // A line written just before exit can still be in flight. One frame
       // of slack costs nothing and is the difference between a reported
       // failure and a silent one.
       settle.restart()
+    }
+
+    // A real exit raises this too, but only after exited() — so an exit
+    // that was never seen by the time running drops is one that is never
+    // coming. A stop() on a live process is not that: it terminates, and
+    // the exit arrives normally.
+    onRunningChanged: {
+      if (!proc.running && root._live && !root._exitSeen) root._failedToStart()
     }
   }
 
@@ -122,6 +154,7 @@ Item {
       if (root._timedOut)
         text = "timed out after " + root._seconds + "s" + (text ? " — " + text : "")
       root.errorText = text
+      root._live = false
       if (root._timedOut) root.timedOut()
       root.exited(root._code)
     }
